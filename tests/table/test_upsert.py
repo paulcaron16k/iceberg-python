@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from datetime import datetime
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -26,11 +27,13 @@ from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.expressions import AlwaysTrue, And, EqualTo, Reference
 from pyiceberg.expressions.literals import LongLiteral
 from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table, UpsertResult
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.upsert_util import create_match_filter
-from pyiceberg.types import IntegerType, NestedField, StringType, StructType
+from pyiceberg.transforms import DayTransform, IdentityTransform
+from pyiceberg.types import IntegerType, NestedField, StringType, StructType, TimestampType
 from tests.catalog.test_base import InMemoryCatalog
 
 
@@ -888,3 +891,114 @@ def test_upsert_snapshot_properties(catalog: Catalog) -> None:
     for snapshot in snapshots[initial_snapshot_count:]:
         assert snapshot.summary is not None
         assert snapshot.summary.additional_properties.get("test_prop") == "test_value"
+
+
+def _partitioned_upsert_table(catalog: Catalog, identifier: str, spec: PartitionSpec) -> tuple[Table, pa.Schema]:
+    """Create a table whose partition fields cover both a transform and an identity."""
+    _drop_table(catalog, identifier)
+    schema = Schema(
+        NestedField(1, "key", StringType(), required=False),
+        NestedField(2, "value", IntegerType(), required=False),
+        NestedField(3, "event_ts", TimestampType(), required=False),
+        NestedField(4, "region", StringType(), required=False),
+    )
+    return catalog.create_table(identifier, schema=schema, partition_spec=spec), schema_to_pyarrow(schema)
+
+
+def test_upsert_rewrites_files_across_partitions(catalog: Catalog) -> None:
+    """Replace a row in each of two partitions in a single upsert.
+
+    The filter matching the replaced files is an `Or` of one term per partition, so a
+    single-partition upsert never builds it. Partitioning by day and upserting a batch
+    that spans days is the ordinary case that does.
+    """
+    identifier = "default.test_upsert_rewrites_files_across_partitions"
+    tbl, arrow_schema = _partitioned_upsert_table(
+        catalog, identifier, PartitionSpec(PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="ts_day"))
+    )
+
+    first, second = datetime(2026, 1, 6, 12), datetime(2026, 2, 20, 12)
+
+    def rows(*records: tuple[str, int, datetime]) -> pa_table:
+        return pa.Table.from_pylist(
+            [{"key": key, "value": value, "event_ts": ts, "region": "eu"} for key, value, ts in records], schema=arrow_schema
+        )
+
+    tbl.append(rows(("a", 1, first), ("b", 1, first), ("c", 1, second), ("d", 1, second)))
+    assert len(tbl.inspect.files()) == 2, "each partition needs its own data file, with a row that must survive"
+
+    assert_upsert_result(
+        tbl.upsert(rows(("a", 2, first), ("c", 2, second)), join_cols=["key"]), expected_updated=2, expected_inserted=0
+    )
+
+    result = tbl.scan().to_arrow()
+    actual = zip(result["key"].to_pylist(), result["value"].to_pylist(), strict=True)
+    assert sorted(actual) == [("a", 2), ("b", 1), ("c", 2), ("d", 1)]
+
+
+def test_upsert_on_multi_field_partition_spec(catalog: Catalog) -> None:
+    """Replace a row on a spec that mixes a transform with an identity field.
+
+    A spec with more than one field joins its terms with `And`, which a single-field spec
+    never reaches. Mixing identity and non-identity fields also covers the case where only
+    part of the spec transforms its source value.
+    """
+    identifier = "default.test_upsert_on_multi_field_partition_spec"
+    tbl, arrow_schema = _partitioned_upsert_table(
+        catalog,
+        identifier,
+        PartitionSpec(
+            PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="ts_day"),
+            PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="region"),
+        ),
+    )
+
+    event_ts = datetime(2026, 1, 6, 12)
+
+    def rows(*records: tuple[str, int]) -> pa_table:
+        return pa.Table.from_pylist(
+            [{"key": key, "value": value, "event_ts": event_ts, "region": "eu"} for key, value in records], schema=arrow_schema
+        )
+
+    tbl.append(rows(("a", 1), ("b", 1)))
+    assert len(tbl.inspect.files()) == 1, "both rows must share a data file to exercise a partial rewrite"
+
+    assert_upsert_result(tbl.upsert(rows(("a", 2)), join_cols=["key"]), expected_updated=1, expected_inserted=0)
+
+    result = tbl.scan().to_arrow()
+    actual = zip(result["key"].to_pylist(), result["value"].to_pylist(), strict=True)
+    assert sorted(actual) == [("a", 2), ("b", 1)]
+
+
+def test_upsert_with_null_partition_value(catalog: Catalog) -> None:
+    """Replace a row whose partition record holds a null.
+
+    A null partition value is matched with `IsNull` rather than `EqualTo`, a branch no
+    other case reaches. The spec keeps a transformed field alongside it so the null is
+    matched as part of a filter that has to survive the transform.
+    """
+    identifier = "default.test_upsert_with_null_partition_value"
+    tbl, arrow_schema = _partitioned_upsert_table(
+        catalog,
+        identifier,
+        PartitionSpec(
+            PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="ts_day"),
+            PartitionField(source_id=4, field_id=1001, transform=IdentityTransform(), name="region"),
+        ),
+    )
+
+    event_ts = datetime(2026, 1, 6, 12)
+
+    def rows(*records: tuple[str, int]) -> pa_table:
+        return pa.Table.from_pylist(
+            [{"key": key, "value": value, "event_ts": event_ts, "region": None} for key, value in records], schema=arrow_schema
+        )
+
+    tbl.append(rows(("a", 1), ("b", 1)))
+    assert len(tbl.inspect.files()) == 1, "both rows must share a data file to exercise a partial rewrite"
+
+    assert_upsert_result(tbl.upsert(rows(("a", 2)), join_cols=["key"]), expected_updated=1, expected_inserted=0)
+
+    result = tbl.scan().to_arrow()
+    actual = zip(result["key"].to_pylist(), result["value"].to_pylist(), strict=True)
+    assert sorted(actual) == [("a", 2), ("b", 1)]
