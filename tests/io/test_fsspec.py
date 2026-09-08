@@ -19,7 +19,9 @@ import os
 import pickle
 import tempfile
 import threading
+import time
 import uuid
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -1152,3 +1154,89 @@ def test_s3v4_rest_signer_uses_auth_manager(requests_mock: Mocker) -> None:
     assert requests_mock.last_request is not None
     assert requests_mock.last_request.headers["Authorization"] == "Bearer via-manager"
     assert request.url == new_uri
+
+
+SIGNER_EVENT = "before-sign.s3"
+SIGNER_UNIQUE_ID = 1925
+
+
+def _signer_properties() -> Properties:
+    return {"s3.signer": "S3V4RestSigner", "uri": TEST_URI, "token": "abc", "s3.region": "us-east-1"}
+
+
+def _signer_installed(emitter: Any) -> bool:
+    return any(isinstance(handler, S3V4RestSigner) for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT))
+
+
+def test_s3_leaves_a_signer_installed_while_reconfiguring_a_shared_client() -> None:
+    """`_s3()` must never leave the shared event emitter without a signer.
+
+    fsspec caches `S3FileSystem`, so the botocore client and its event emitter are shared by
+    every thread, and `_s3()` sets `signature_version=UNSIGNED`. A request signed while no
+    handler is installed is therefore sent with no `Authorization` header, and the store
+    answers 403.
+    """
+    fs = fsspec._s3(_signer_properties())
+    emitter = fs.s3.meta.events
+    real_unregister = emitter.unregister
+    installed: list[bool] = []
+
+    def watched_unregister(*args: Any, **kwargs: Any) -> None:
+        real_unregister(*args, **kwargs)
+        installed.append(_signer_installed(emitter))
+
+    with mock.patch.object(emitter, "unregister", watched_unregister):
+        fsspec._s3(_signer_properties())
+
+    # Asserted as well as the window, so the test still says something if a future `_s3()`
+    # stops touching this emitter at all -- otherwise it would pass on an empty observation
+    # list for reasons unrelated to the defect.
+    assert _signer_installed(emitter), "a signer must be installed once _s3() returns"
+    assert all(installed), (
+        f"_s3() left the shared signing emitter with no handler ({installed.count(False)} of {len(installed)} observations)"
+    )
+
+
+def test_the_signer_stays_installed_while_another_thread_reconfigures_s3() -> None:
+    """The same defect under concurrency, which is how production reaches it.
+
+    `FsspecFileIO.get_fs` caches per thread and every table gets its own `FileIO`, so a short
+    workload makes hundreds of `_s3()` calls against the one shared emitter, any of which can
+    open the window under a thread that is signing.
+
+    The window is two adjacent statements, so sampling for it blind is a coin flip -- 20,000
+    observations against an unmodified `_s3()` caught it zero times. It is held open here by
+    delaying the *re-registration* only: the `unregister` that opens it, the emitter, and the
+    thread that observes it are all real, and dropping the `unregister` closes the window
+    whatever the delay. Timing is made deterministic; the defect is not manufactured.
+    """
+    fs = fsspec._s3(_signer_properties())
+    emitter = fs.s3.meta.events
+    real_register_last = emitter.register_last
+
+    def slow_register_last(*args: Any, **kwargs: Any) -> None:
+        time.sleep(0.05)
+        real_register_last(*args, **kwargs)
+
+    observations: list[bool] = []
+    stop = threading.Event()
+
+    def observe() -> None:
+        while not stop.is_set():
+            observations.append(_signer_installed(emitter))
+            time.sleep(0.001)
+
+    watcher = threading.Thread(target=observe, daemon=True)
+    watcher.start()
+    try:
+        with mock.patch.object(emitter, "register_last", slow_register_last):
+            fsspec._s3(_signer_properties())
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    missing = observations.count(False)
+    assert missing == 0, (
+        f"{missing} of {len(observations)} observations from another thread found the shared "
+        "emitter with no signer installed; a request signed at that moment is sent unsigned"
+    )
