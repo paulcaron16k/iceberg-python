@@ -12,7 +12,7 @@ Zamboni repository).
 |---|---|
 | Base | `apache/iceberg-python` **`main` at `9299bdb8`**, pinned |
 | Consumers | ExperienceFlow IWS, via a pinned commit — not via this branch name |
-| Upstream target for every patch | `main` |
+| Purpose | Hold what Zamboni currently reaches past the fence for |
 
 ## Why `main` and not the `pyiceberg-0.12.x` release branch
 
@@ -41,20 +41,25 @@ which a path dependency to a sibling checkout never was.
 
 ## How a patch gets here
 
-One branch per enhancement, each self-contained and reviewable by someone who
-knows nothing about Zamboni:
+One branch per override being moved, each self-contained and each carrying the
+tests that prove it:
 
 ```text
 enh/<short-name>          branched from the same pinned base
-  - the change
+  - the behaviour, implemented in the library
   - its tests, which fail without it
                           -> merged into feature/maintenance
-                          -> proposed upstream as its own pull request
+                          -> the matching override deleted from Zamboni,
+                             in the same change that adopts it
 ```
 
-Keeping them separate is the point. They can be reviewed, merged and **retired**
-in any order, and a patch that lands upstream is deleted from here rather than
-carried forever.
+**Nothing here is proposed upstream.** No pull requests, no issues, no comments
+on existing ones. The patches are written in upstream's own style and tested
+with upstream's own fixtures because that is how they stay reviewable and
+rebasable — not because they are going anywhere.
+
+Keeping them separate is what lets each override move independently, and what
+would let any of them be dropped if upstream ever implements the same thing.
 
 ## What is on this branch
 
@@ -69,22 +74,24 @@ stories are worked.
 
 Third-party pull requests are not merged here without a decision, however useful
 they look. [#3131](https://github.com/apache/iceberg-python/pull/3131) would
-retire two of Zamboni's private reaches — `_ReplaceFiles` and its `_summary`
-relabel — and it has been open since 2026-03-09; carrying 1130 lines of somebody
-else's unmerged work in a production dependency is a bigger commitment than
-carrying our own, and is a call for the humans.
+cover the same ground as Zamboni's `_ReplaceFiles` and its `_summary` relabel,
+and was measured against Zamboni's suite (815 passed, 1 pre-existing failure) —
+but carrying 1130 lines of somebody else's unmerged work in a production
+dependency is a bigger commitment than carrying our own, and is a call for the
+humans.
 
-## Retiring this branch
+## Retiring a patch
 
-Every patch here is a liability with an expiry date. When its upstream pull
-request merges:
+A patch leaves this branch when upstream ships the same behaviour, which is not
+something anyone here is arranging. If that happens:
 
-1. Drop the patch from this branch.
-2. Remove the corresponding workaround from Zamboni in the *same* change.
+1. Confirm by measurement that the released library does what the patch did.
+2. Drop the patch from this branch and rebase onto the release.
 3. Delete its row from the table above.
 
 When the table is empty, delete the branch and pin the consumer back to a
-released PyIceberg.
+released PyIceberg. Until then this branch is the dependency, and every row in
+the table is something Zamboni no longer has to do behind the library's back.
 
 ## Verifying a change against Zamboni
 
