@@ -228,11 +228,26 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
 
     def _manifests(self) -> list[ManifestFile]:
         def _write_added_manifest() -> list[ManifestFile]:
-            if self._added_data_files:
-                with self.new_manifest_writer(
-                    spec=self._transaction.table_metadata.spec(),
-                ) as writer:
-                    for data_file in self._added_data_files:
+            if not self._added_data_files:
+                return []
+
+            # Group by each file's own spec, as _write_delete_manifest does below.
+            # A partition Record has the arity of the spec that produced it, so a
+            # file written under a non-default spec cannot be described by a
+            # manifest declared under the default one -- the Avro writer indexes
+            # past the end of the record. `spec_id` is not part of the data-file
+            # struct, so it is unset on a freshly written file: absent means "the
+            # table default", which is what every caller that does not evolve
+            # partitions gets.
+            default_spec_id = self._transaction.table_metadata.default_spec_id
+            partition_groups: dict[int, list[DataFile]] = defaultdict(list)
+            for data_file in self._added_data_files:
+                partition_groups[getattr(data_file, "spec_id", default_spec_id)].append(data_file)
+
+            added_manifests = []
+            for spec_id, data_files in partition_groups.items():
+                with self.new_manifest_writer(spec=self.spec(spec_id)) as writer:
+                    for data_file in data_files:
                         writer.add(
                             ManifestEntry.from_args(
                                 status=ManifestEntryStatus.ADDED,
@@ -242,9 +257,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
                                 data_file=data_file,
                             )
                         )
-                return [writer.to_manifest_file()]
-            else:
-                return []
+                added_manifests.append(writer.to_manifest_file())
+            return added_manifests
 
         def _write_delete_manifest() -> list[ManifestFile]:
             if len(deleted_entries) > 0:
@@ -288,16 +302,22 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             )
         )
         ssc = SnapshotSummaryCollector(partition_summary_limit=partition_summary_limit)
+        specs = table_metadata.specs()
 
         for data_file in self._added_data_files:
+            # Each file's own spec, as the removed files below already use. A
+            # partition Record only means anything read through the spec that
+            # produced it, so rendering one through the table default labels it
+            # with another spec's field names -- and that label is written into
+            # permanent snapshot metadata. Absent means the table default, which
+            # is what every caller that does not evolve partitions gets.
             ssc.add_file(
                 data_file=data_file,
-                partition_spec=default_spec,
+                partition_spec=specs.get(getattr(data_file, "spec_id", -1), default_spec),
                 schema=schema,
             )
 
         if len(self._deleted_data_files) > 0:
-            specs = table_metadata.specs()
             for data_file in self._deleted_data_files:
                 ssc.remove_file(
                     data_file=data_file,

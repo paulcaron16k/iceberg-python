@@ -17,6 +17,7 @@
 # pylint:disable=redefined-outer-name,eval-used
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
@@ -44,13 +45,14 @@ from pyiceberg.table.snapshots import (
     latest_ancestor_before_timestamp,
     update_snapshot_summaries,
 )
-from pyiceberg.transforms import IdentityTransform
+from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.typedef import Record
 from pyiceberg.types import (
     BooleanType,
     IntegerType,
     NestedField,
     StringType,
+    TimestampType,
 )
 
 
@@ -737,3 +739,90 @@ def test_overwrite_rejects_explicit_delete_without_parent_snapshot(
         with empty.transaction() as tx:
             with tx.update_snapshot().overwrite() as overwrite:
                 overwrite.delete_data_file(stale_file)
+
+
+@pytest.fixture
+def evolved_table(catalog: Catalog) -> Table:
+    """A table whose partition spec has evolved, so two specs are in play.
+
+    Files written before the evolution belong to spec 0; the table default is
+    now spec 1. That is the ordinary state of any table using partition
+    evolution, and the state a compaction has to write into.
+    """
+    catalog.create_namespace("evolved")
+    schema = Schema(
+        NestedField(1, "ts", TimestampType(), required=False),
+        NestedField(2, "region", StringType(), required=False),
+    )
+    spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=DayTransform(), name="ts_day"))
+    table = catalog.create_table("evolved.tbl", schema, partition_spec=spec)
+    table.append(
+        pa.table(
+            {
+                "ts": pa.array([datetime(2026, 1, 3, 1)], type=pa.timestamp("us")),
+                "region": pa.array(["eu"]),
+            }
+        )
+    )
+    table.update_spec().add_identity("region").commit()
+    return catalog.load_table("evolved.tbl")
+
+
+def test_added_file_is_written_under_its_own_partition_spec(catalog: Catalog, evolved_table: Table) -> None:
+    """An added file carrying a `spec_id` must land in a manifest for that spec.
+
+    `_write_delete_manifest` already groups deleted entries by
+    `data_file.spec_id`. `_write_added_manifest` declares one manifest under
+    `table_metadata.spec()` — the table default — for every added file, whatever
+    spec its partition values were computed under.
+
+    That matters because a partition `Record` has the arity of the spec that
+    produced it. Writing a spec-0 file (one partition field) into a manifest
+    declared under spec 1 (two fields) does not merely mislabel it: the Avro
+    writer indexes past the end of the record and raises
+    `IndexError: list index out of range`, from inside
+    `pyiceberg/avro/writer.py`, with nothing naming partition specs.
+
+    A caller has exactly one channel for saying which spec an added file belongs
+    to — `spec_id` is not part of the data-file struct, so it is absent on a
+    freshly written file and set explicitly — and that channel is honoured on the
+    delete side and ignored on the add side.
+    """
+    original = evolved_table.metadata
+    rows = evolved_table.scan().to_arrow()
+
+    # Written under spec 0, which is what a compaction produces for data it is
+    # rewriting but not evolving.
+    replacement = list(
+        _dataframe_to_data_files(
+            table_metadata=original.model_copy(update={"default_spec_id": 0}),
+            df=rows,
+            io=evolved_table.io,
+            write_uuid=uuid.uuid4(),
+        )
+    )
+    for data_file in replacement:
+        data_file.spec_id = 0
+
+    doomed = [task.file for task in evolved_table.scan().plan_files()]
+    with evolved_table.transaction() as tx:
+        with tx.update_snapshot().overwrite() as overwrite:
+            for data_file in doomed:
+                overwrite.delete_data_file(data_file)
+            for data_file in replacement:
+                overwrite.append_data_file(data_file)
+
+    committed = catalog.load_table("evolved.tbl")
+    snapshot = committed.current_snapshot()
+    assert snapshot is not None
+
+    for manifest in snapshot.manifests(io=committed.io):
+        entries = manifest.fetch_manifest_entry(io=committed.io, discard_deleted=False)
+        mismatched = {e.data_file.spec_id for e in entries} - {manifest.partition_spec_id}
+        assert not mismatched, (
+            f"manifest declares spec {manifest.partition_spec_id} but holds entries for "
+            f"spec(s) {sorted(mismatched)}; partition values are then read through the "
+            "wrong spec"
+        )
+
+    assert committed.scan().to_arrow().num_rows == rows.num_rows
