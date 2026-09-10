@@ -63,12 +63,13 @@ would let any of them be dropped if upstream ever implements the same thing.
 
 ## What is on this branch
 
-Nothing yet beyond the base and this file. Patches are added as their Zamboni
-stories are worked.
+Patches are added as their Zamboni stories are worked. The right-hand column
+is the point: each row is something Zamboni stops doing behind the library's
+back, and it is deleted from Zamboni in the change that adopts the patch.
 
-| Patch | Zamboni story | Retires | Upstream |
-|---|---|---|---|
-| *(none yet)* | | | |
+| Patch | Zamboni story | Replaces in Zamboni |
+|---|---|---|
+| Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` |
 
 ### Deliberately **not** carried
 
