@@ -70,6 +70,7 @@ back, and it is deleted from Zamboni in the change that adopts the patch.
 | Patch | Zamboni story | Replaces in Zamboni |
 |---|---|---|
 | Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` |
+| A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | `ReplaceCommitter`'s table-level `expected_snapshot_id` guard in `committer.py` |
 
 ### Deliberately **not** carried
 
