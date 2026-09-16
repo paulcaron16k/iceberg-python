@@ -826,3 +826,74 @@ def test_added_file_is_written_under_its_own_partition_spec(catalog: Catalog, ev
         )
 
     assert committed.scan().to_arrow().num_rows == rows.num_rows
+
+
+def test_file_rewrite_survives_an_unrelated_concurrent_append(
+    catalog: Catalog, overwrite_table: Table, arrow_table_simple: pa.Table
+) -> None:
+    """A rewrite asserts nothing about rows it never read, so an append cannot invalidate it.
+
+    Serializable isolation ran `_validate_added_data_files` with a `None` filter
+    for any operation without a conflict-detection filter, and a `None` filter
+    matches everything -- so a file-level rewrite conflicted with *every*
+    concurrent append, including one in a partition it never touched. Java draws
+    the line differently and this test pins the corrected behaviour: RewriteFiles
+    validates that its own files still exist, not that nobody else appended.
+
+    `_validate_data_files_exist` is deliberately untouched by the change, which
+    the companion test below holds it to.
+    """
+    original_file = next(iter(overwrite_table.scan().plan_files())).file
+    replacement = _write_data_file(overwrite_table, arrow_table_simple.slice(0, 1))
+
+    # The rewrite begins here: this transaction's base snapshot is captured now.
+    tx = overwrite_table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.delete_data_file(original_file)
+    update.append_data_file(replacement)
+
+    # Someone else appends while it is in flight, touching none of its files.
+    catalog.load_table(overwrite_table.name()).append(arrow_table_simple)
+
+    update.commit()
+    tx.commit_transaction()
+
+    rewritten = catalog.load_table(overwrite_table.name())
+    # The append survived and the rewrite landed: one replacement file plus the
+    # three rows the concurrent append added.
+    assert sorted(rewritten.scan().to_arrow()["foo"].to_pylist()) == ["a", "a", "b", "c"]
+
+
+def test_file_rewrite_is_still_refused_when_its_own_files_were_replaced(
+    catalog: Catalog, overwrite_table: Table, arrow_table_simple: pa.Table
+) -> None:
+    """The protection that matters must survive the loosening above.
+
+    Narrowing added-file validation must not narrow this: if a concurrent commit
+    replaced a file the rewrite is deleting, committing anyway would resurrect
+    the rows it read at plan time and lose the other writer's update.
+    """
+    original_file = next(iter(overwrite_table.scan().plan_files())).file
+    replacement = _write_data_file(overwrite_table, arrow_table_simple.slice(0, 1))
+
+    tx = overwrite_table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.delete_data_file(original_file)
+    update.append_data_file(replacement)
+
+    # Someone else replaces the very file this rewrite is removing.
+    other = catalog.load_table(overwrite_table.name())
+    other_replacement = _write_data_file(other, arrow_table_simple.slice(1, 1))
+    with other.transaction() as other_tx:
+        with other_tx.update_snapshot().overwrite() as other_update:
+            other_update.delete_data_file(original_file)
+            other_update.append_data_file(other_replacement)
+
+    # Matched on the file rather than the wording: which validator reports it
+    # first varies (`Missing required files to delete` from
+    # `_validate_data_files_exist`, `Data files were concurrently deleted` from
+    # `_validate_no_new_deletes_for_data_files`), and the property under test is
+    # that the rewrite is refused and told which file, not which check said so.
+    with pytest.raises(ValidationException, match=re.escape(original_file.file_path)):
+        update.commit()
+        tx.commit_transaction()

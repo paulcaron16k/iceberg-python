@@ -511,7 +511,22 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         isolation_level = table.metadata.isolation_level(self._isolation_operation)
         conflict_detection_filter = self._predicate if self._predicate != AlwaysFalse() else None
 
-        if isolation_level == IsolationLevel.SERIALIZABLE:
+        if isolation_level == IsolationLevel.SERIALIZABLE and conflict_detection_filter is not None:
+            # Only when the operation has a conflict-detection filter. Without one
+            # this ran with `None`, which `_validate_added_data_files` treats as
+            # "match everything", so *any* concurrently appended file conflicted --
+            # including one in a partition the operation never touched.
+            #
+            # That is over-broad for a file-level rewrite. Compaction deletes named
+            # data files and adds equivalent ones; it asserts nothing about rows it
+            # did not read, so a concurrent append cannot invalidate it. Java draws
+            # the same line: RewriteFiles validates that its files still exist and
+            # does not validate added files. The protection that matters for such an
+            # operation is `_validate_data_files_exist` below, which is unchanged.
+            #
+            # The two validators immediately below are already guarded this way; this
+            # one was not, which is the inconsistency being fixed rather than a new
+            # policy.
             _validate_added_data_files(table, catalog_head, conflict_detection_filter, starting_snapshot)
 
         if self._predicate != AlwaysFalse():
