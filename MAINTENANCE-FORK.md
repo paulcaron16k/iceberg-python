@@ -71,6 +71,24 @@ back, and it is deleted from Zamboni in the change that adopts the patch.
 |---|---|---|
 | Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` |
 | A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | `ReplaceCommitter`'s table-level `expected_snapshot_id` guard in `committer.py` |
+| A manifest can be written with `content: deletes` (`write_manifest`, `ManifestWriterV2`) | ELT-1118 — see below | `_DeleteManifestWriter` in `testing.py` |
+
+### The delete-manifest patch broadens this branch, deliberately
+
+Every row above it moves something **Zamboni** reaches past the fence for, and is driven by a
+Zamboni story. The delete-manifest writer is the first that is not: it is driven by
+**`target-iceberg`'s merge-on-read initiative (ELT-1107)**, which cannot commit a delete file of any
+kind without it — `ManifestWriterV2.content()` returned `ManifestContent.DATA` unconditionally, so
+there was nowhere to put one.
+
+It still earns its row on the original terms, because Zamboni already carries the same override:
+`_DeleteManifestWriter` in `src/zamboni/testing.py`, which exists only so the merge-on-read path can
+be exercised at all. That override is deleted when Zamboni adopts this patch, exactly as the others
+are.
+
+What changes is the branch's stated purpose: it now carries patches **two** consumers need, not one.
+Worth knowing before the next patch is proposed, because "does Zamboni need it?" is no longer the
+whole test.
 
 ### Deliberately **not** carried
 
