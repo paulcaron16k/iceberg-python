@@ -86,6 +86,7 @@ from pyiceberg.io.pyarrow import (
     parquet_path_to_id_mapping,
     schema_to_pyarrow,
     write_file,
+    write_positional_deletes,
 )
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.partitioning import PartitionField, PartitionSpec
@@ -5462,3 +5463,115 @@ def test_dictionary_columns_produces_dict_encoded_output(tmpdir: str) -> None:
 
     # Values must be identical
     assert result_plain.column("label").to_pylist() == result_dict.column("label").to_pylist()
+
+
+def _table_with_one_data_file(tmp_path: Path) -> tuple[Any, Any]:
+    """A two-row v2 table and its single data file, for the delete-writer tests."""
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    warehouse = tmp_path / "warehouse"
+    warehouse.mkdir(exist_ok=True)
+    catalog = SqlCatalog("t", uri=f"sqlite:///{tmp_path / 'catalog.db'}", warehouse=f"file://{warehouse}")
+    catalog.create_namespace("ns")
+    table = catalog.create_table(
+        "ns.t",
+        schema=Schema(NestedField(1, "id", LongType(), required=True)),
+        properties={"format-version": "2"},
+    )
+    table.append(pa.table({"id": pa.array([1, 2, 3], type=pa.int64())}, schema=table.schema().as_arrow()))
+    return table, next(iter(table.scan().plan_files())).file
+
+
+def test_write_positional_deletes_describes_a_position_delete_file(tmp_path: Path) -> None:
+    """The ``DataFile`` must say what it is, or the manifest entry describes a data file."""
+    table, data_file = _table_with_one_data_file(tmp_path)
+
+    delete_file = write_positional_deletes(table.io, table.metadata, [(data_file.file_path, 1)])
+
+    assert delete_file.content == DataFileContent.POSITION_DELETES
+    assert delete_file.record_count == 1
+    # The spec: a delete file carries no sort order, and readers must ignore one if present. The
+    # ordering below is mandated rather than configured, so there is nothing to record here.
+    assert delete_file.sort_order_id is None
+
+
+def test_write_positional_deletes_sorts_by_file_path_then_pos(tmp_path: Path) -> None:
+    """Spec-mandatory, and the reason is mechanical.
+
+    Sorting by ``file_path`` makes the column cheap to filter; sorting by ``pos`` within it lets a
+    reader stream the delete file against the data file rather than holding it in memory. Input
+    order is deliberately reversed here, and duplicates deliberately included.
+    """
+    table, data_file = _table_with_one_data_file(tmp_path)
+
+    delete_file = write_positional_deletes(
+        table.io, table.metadata, [(data_file.file_path, 2), (data_file.file_path, 0), (data_file.file_path, 2)]
+    )
+
+    with table.io.new_input(delete_file.file_path).open() as fi:
+        written = pq.read_table(fi)
+
+    assert written.column("pos").to_pylist() == [0, 2], "not sorted, or duplicates not collapsed"
+    assert written.column("file_path").to_pylist() == [data_file.file_path] * 2
+
+
+def test_write_positional_deletes_writes_pos_as_a_long(tmp_path: Path) -> None:
+    """The spec types ``pos`` as a ``long``; ``int`` caps a referenced file at 2^31 rows."""
+    table, data_file = _table_with_one_data_file(tmp_path)
+
+    delete_file = write_positional_deletes(table.io, table.metadata, [(data_file.file_path, 1)])
+
+    with table.io.new_input(delete_file.file_path).open() as fi:
+        assert pq.read_table(fi).schema.field("pos").type == pa.int64()
+
+
+def test_write_positional_deletes_writes_the_file_path_bounds_in_full(tmp_path: Path) -> None:
+    """Truncated bounds are not merely imprecise here — they lose the referenced file.
+
+    The default metrics mode is ``truncate(16)``. ``DeleteFileIndex`` recovers which data file a
+    delete file refers to by checking that the lower and upper ``file_path`` bounds are *equal*
+    (``_referenced_data_file_path``), which truncation breaks — so the delete file falls back to a
+    coarser partition-level match instead of being attached to its file.
+    """
+    table, data_file = _table_with_one_data_file(tmp_path)
+
+    delete_file = write_positional_deletes(table.io, table.metadata, [(data_file.file_path, 1)])
+
+    path_field_id = 2147483546
+    lower = delete_file.lower_bounds[path_field_id]
+    upper = delete_file.upper_bounds[path_field_id]
+    assert lower == upper, "the bounds must be equal for the index to recover the referenced file"
+    assert lower.decode("utf-8") == data_file.file_path, "the bound was truncated"
+
+
+def test_write_positional_deletes_refuses_an_empty_delete_file(tmp_path: Path) -> None:
+    """An empty delete file is not a no-op: every scan opens it and it deletes nothing."""
+    table, _ = _table_with_one_data_file(tmp_path)
+
+    with pytest.raises(ValueError, match="no deletes"):
+        write_positional_deletes(table.io, table.metadata, [])
+
+
+def test_a_written_delete_file_is_attached_to_its_data_file_by_the_scan_planner(tmp_path: Path) -> None:
+    """The output has to be usable by the half of the library that reads it.
+
+    This is the test that would have caught truncated bounds, a wrong ``content``, or a missing
+    sequence number — none of which fail at write time.
+    """
+    from pyiceberg.manifest import ManifestEntry, ManifestEntryStatus
+    from pyiceberg.table.delete_file_index import DeleteFileIndex
+
+    table, data_file = _table_with_one_data_file(tmp_path)
+    table.append(pa.table({"id": pa.array([4, 5, 6], type=pa.int64())}, schema=table.schema().as_arrow()))
+    other = [t.file for t in table.scan().plan_files() if t.file.file_path != data_file.file_path][0]
+
+    delete_file = write_positional_deletes(table.io, table.metadata, [(data_file.file_path, 0)])
+    index = DeleteFileIndex()
+    index.add_delete_file(ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=2, data_file=delete_file))
+
+    assert len(index.for_data_file(1, data_file)) == 1, "not attached to the file it references"
+    assert len(index.for_data_file(1, other)) == 0, "attached to a file it does not reference"
+    # Positional deletes apply at an *equal* sequence number, which is what lets a commit delete
+    # rows it added itself. Equality deletes use strictly-less-than for the opposite reason.
+    assert len(index.for_data_file(2, data_file)) == 1
+    assert len(index.for_data_file(3, data_file)) == 0

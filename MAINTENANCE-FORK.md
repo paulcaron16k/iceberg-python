@@ -72,6 +72,7 @@ back, and it is deleted from Zamboni in the change that adopts the patch.
 | Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` |
 | A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | `ReplaceCommitter`'s table-level `expected_snapshot_id` guard in `committer.py` |
 | A manifest can be written with `content: deletes` (`write_manifest`, `ManifestWriterV2`) | ELT-1118 — see below | `_DeleteManifestWriter` in `testing.py` |
+| Positional delete files can be written, and `pos` is typed `long` as the spec requires (`write_positional_deletes`, `POSITIONAL_DELETE_SCHEMA`) | ELT-1121 — see below | the hand-written delete Parquet in `testing.py` |
 
 ### The delete-manifest patch broadens this branch, deliberately
 

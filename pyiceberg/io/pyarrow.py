@@ -126,6 +126,7 @@ from pyiceberg.io import (
 from pyiceberg.io.fileformat import DataFileStatistics as DataFileStatistics
 from pyiceberg.io.fileformat import FileFormatFactory, FileFormatModel, FileFormatWriter
 from pyiceberg.manifest import (
+    POSITIONAL_DELETE_SCHEMA,
     DataFile,
     DataFileContent,
     FileFormat,
@@ -2876,6 +2877,104 @@ def _check_pyarrow_schema_compatible(
             "Update the schema first (hint, use union_by_name)."
         ) from e
     _check_schema_compatible(requested_schema, provided_schema)
+
+
+def write_positional_deletes(
+    io: FileIO,
+    table_metadata: TableMetadata,
+    deletes: Iterable[tuple[str, int]],
+    partition: Record | None = None,
+    spec_id: int | None = None,
+) -> DataFile:
+    """Write one positional delete file and return the ``DataFile`` describing it.
+
+    A positional delete names the rows to remove by ``(file_path, pos)`` -- the data file and the
+    row's ordinal position in it, counted from 0.
+
+    Three details are load-bearing rather than stylistic:
+
+    * **The rows are sorted by ``file_path`` then ``pos``.** The spec requires it, so that a reader
+      can stream a delete file instead of holding it in memory, and so the ``file_path`` column is
+      cheap to filter on.
+    * **The ``file_path`` bounds are written in full, never truncated.** The default metrics mode is
+      ``truncate(16)``, and a truncated bound here is not merely imprecise. ``DeleteFileIndex``
+      recovers the referenced data file by checking whether the lower and upper bounds are *equal*
+      (``_referenced_data_file_path``); under truncation they are not, so the index silently falls
+      back to a coarser partition-level match. Writing them whole is what keeps a delete file
+      attached to the file it refers to.
+    * **``sort_order_id`` is null.** The spec is explicit that a delete file carries none and that
+      readers must ignore any it finds -- the ordering above is mandated, not configured.
+
+    The optional ``row`` column is not written. It is spec-legal and no implementation produces it;
+    Java removed it from its writers in 1.12.0.
+
+    Args:
+        io: The FileIO to write through.
+        table_metadata: Table metadata, for the location provider and write properties.
+        deletes: ``(data file path, row position)`` pairs. Need not be sorted or unique.
+        partition: The partition the deleted rows live in. A delete file applies only within its
+            own partition, so this must match the data files it references.
+        spec_id: The partition spec the delete file is written under, defaulting to the table's.
+
+    Returns:
+        The ``DataFile``, with ``content`` set to ``POSITION_DELETES``.
+
+    Raises:
+        ValueError: If ``deletes`` is empty. An empty delete file is not a no-op -- it is a file in
+            the tree that every scan has to open and that deletes nothing.
+    """
+    from pyiceberg.table import TableProperties
+
+    rows = sorted(set(deletes))
+    if not rows:
+        raise ValueError("Cannot write a positional delete file with no deletes")
+
+    arrow_schema = schema_to_pyarrow(POSITIONAL_DELETE_SCHEMA, include_field_ids=True)
+    arrow_table = pa.table(
+        {
+            "file_path": pa.array([path for path, _ in rows], type=pa.large_string()),
+            "pos": pa.array([pos for _, pos in rows], type=pa.int64()),
+        },
+        schema=arrow_schema,
+    )
+
+    location_provider = load_location_provider(table_location=table_metadata.location, table_properties=table_metadata.properties)
+    file_path = location_provider.new_data_location(f"{uuid.uuid4()}-deletes.parquet")
+
+    # ``full`` rather than the ``truncate(16)`` default, for the reason in the docstring: the index
+    # identifies the referenced data file by the bounds being equal, which truncation destroys.
+    write_properties = {
+        **table_metadata.properties,
+        f"{TableProperties.METRICS_MODE_COLUMN_CONF_PREFIX}.file_path": "full",
+    }
+
+    fo = io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=arrow_schema, **_get_parquet_writer_kwargs(write_properties)) as writer:
+            writer.write_table(arrow_table)
+
+    with io.new_input(file_path).open() as fi:
+        parquet_metadata = pq.read_metadata(fi)
+
+    statistics = data_file_statistics_from_parquet_metadata(
+        parquet_metadata=parquet_metadata,
+        stats_columns=compute_statistics_plan(POSITIONAL_DELETE_SCHEMA, write_properties),
+        parquet_column_mapping=parquet_path_to_id_mapping(POSITIONAL_DELETE_SCHEMA),
+    )
+
+    return DataFile.from_args(
+        content=DataFileContent.POSITION_DELETES,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        partition=partition if partition is not None else Record(),
+        file_size_in_bytes=len(fo),
+        # The spec: a delete file has no sort order, and readers must ignore one if present.
+        sort_order_id=None,
+        spec_id=spec_id if spec_id is not None else table_metadata.default_spec_id,
+        equality_ids=None,
+        key_metadata=None,
+        **statistics.to_serialized_dict(),
+    )
 
 
 def parquet_files_to_data_files(io: FileIO, table_metadata: TableMetadata, file_paths: Iterator[str]) -> Iterator[DataFile]:
