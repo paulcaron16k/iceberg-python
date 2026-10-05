@@ -127,6 +127,16 @@ class CommitWindow:
         return self.head is None or (self.base is not None and self.base.snapshot_id == self.head.snapshot_id)
 
 
+def _manifest_content_for(data_file: DataFile) -> ManifestContent:
+    """Return the manifest content a file belongs in, which follows from what the file *is*.
+
+    The spec keeps delete files in their own manifests, so the two cannot share one. Both delete
+    kinds go to the same place: `ManifestContent` distinguishes data from deletes, and
+    `DataFileContent` distinguishes positional deletes from equality deletes within them.
+    """
+    return ManifestContent.DATA if data_file.content == DataFileContent.DATA else ManifestContent.DELETES
+
+
 class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     commit_uuid: uuid.UUID
     _io: FileIO
@@ -239,14 +249,20 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             # struct, so it is unset on a freshly written file: absent means "the
             # table default", which is what every caller that does not evolve
             # partitions gets.
+            # Grouped by content as well as spec. A manifest holds data files or delete files,
+            # never both: the spec requires delete files to be tracked in their own manifests, and a
+            # manifest labelled `data` that holds delete files is readable-but-wrong rather than
+            # broken -- an engine that prunes on manifest content applies no deletes at all and
+            # reports no error.
             default_spec_id = self._transaction.table_metadata.default_spec_id
-            partition_groups: dict[int, list[DataFile]] = defaultdict(list)
+            partition_groups: dict[tuple[int, ManifestContent], list[DataFile]] = defaultdict(list)
             for data_file in self._added_data_files:
-                partition_groups[getattr(data_file, "spec_id", default_spec_id)].append(data_file)
+                spec_id = getattr(data_file, "spec_id", default_spec_id)
+                partition_groups[(spec_id, _manifest_content_for(data_file))].append(data_file)
 
             added_manifests = []
-            for spec_id, data_files in partition_groups.items():
-                with self.new_manifest_writer(spec=self.spec(spec_id)) as writer:
+            for (spec_id, content), data_files in partition_groups.items():
+                with self.new_manifest_writer(spec=self.spec(spec_id), content=content) as writer:
                     for data_file in data_files:
                         writer.add(
                             ManifestEntry.from_args(
@@ -411,7 +427,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     def spec(self, spec_id: int) -> PartitionSpec:
         return self._transaction.table_metadata.specs()[spec_id]
 
-    def new_manifest_writer(self, spec: PartitionSpec) -> ManifestWriter:
+    def new_manifest_writer(self, spec: PartitionSpec, content: ManifestContent = ManifestContent.DATA) -> ManifestWriter:
         return write_manifest(
             format_version=self._transaction.table_metadata.format_version,
             spec=spec,
@@ -419,6 +435,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             output_file=self.new_manifest_output(),
             snapshot_id=self._snapshot_id,
             avro_compression=self._compression,
+            content=content,
         )
 
     def new_manifest_output(self) -> OutputFile:

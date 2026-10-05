@@ -27,7 +27,7 @@ import pytest
 
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import ValidationException
-from pyiceberg.io.pyarrow import _dataframe_to_data_files
+from pyiceberg.io.pyarrow import _dataframe_to_data_files, write_positional_deletes
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
@@ -897,3 +897,82 @@ def test_file_rewrite_is_still_refused_when_its_own_files_were_replaced(
     with pytest.raises(ValidationException, match=re.escape(original_file.file_path)):
         update.commit()
         tx.commit_transaction()
+
+
+@pytest.fixture
+def deletable_table(catalog: Catalog) -> Table:
+    """Five rows in one data file, so positions 0-4 are known and stable."""
+    catalog.create_namespace("merge_on_read")
+    rows = pa.table({"id": pa.array([1, 2, 3, 4, 5], type=pa.int64())})
+    table = catalog.create_table("merge_on_read.t", rows.schema, properties={"format-version": "2"})
+    table.append(rows)
+    return table
+
+
+def test_a_committed_positional_delete_file_removes_its_rows(deletable_table: Table) -> None:
+    """The end-to-end claim: a merge-on-read table can be written and read back.
+
+    Each piece passes on its own without this working -- a delete file can be well-formed, and a
+    manifest correctly labelled, while the rows still come back. This is the test that says the
+    three fit together.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(
+        deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1), (data_file.file_path, 3)]
+    )
+
+    with deletable_table.transaction() as txn:
+        with txn.update_snapshot().fast_append() as producer:
+            producer.append_data_file(delete_file)
+
+    assert [row["id"] for row in deletable_table.scan().to_arrow().to_pylist()] == [1, 3, 5]
+
+
+def test_a_delete_file_is_committed_into_its_own_manifest(deletable_table: Table) -> None:
+    """Data files and delete files never share a manifest.
+
+    The spec keeps them apart, and the failure if they do not is silent: a manifest labelled
+    ``data`` that holds delete files is readable-but-wrong, because an engine that prunes on
+    manifest content applies no deletes and reports no error.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 0)])
+
+    with deletable_table.transaction() as txn:
+        with txn.update_snapshot().fast_append() as producer:
+            producer.append_data_file(delete_file)
+
+    snapshot = deletable_table.current_snapshot()
+    assert snapshot is not None
+    contents = sorted(ManifestContent(m.content).name for m in snapshot.manifests(deletable_table.io))
+    assert contents == ["DATA", "DELETES"]
+    for manifest in snapshot.manifests(deletable_table.io):
+        entries = manifest.fetch_manifest_entry(deletable_table.io)
+        expected = DataFileContent.DATA if manifest.content == ManifestContent.DATA else DataFileContent.POSITION_DELETES
+        assert all(entry.data_file.content == expected for entry in entries), (
+            "a manifest's declared content disagrees with the files inside it"
+        )
+
+
+def test_committing_a_delete_file_is_counted_in_the_snapshot_summary(deletable_table: Table) -> None:
+    """The summary is what a maintenance runner reads to decide a table needs compacting.
+
+    A merge-on-read table whose deletes are invisible in its own summary looks like one that needs
+    nothing done to it.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(
+        deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1), (data_file.file_path, 3)]
+    )
+
+    with deletable_table.transaction() as txn:
+        with txn.update_snapshot().fast_append() as producer:
+            producer.append_data_file(delete_file)
+
+    snapshot = deletable_table.current_snapshot()
+    assert snapshot is not None
+    summary = snapshot.summary
+    assert summary is not None
+    assert summary["added-position-deletes"] == "2"
+    assert summary["added-delete-files"] == "1"
+    assert summary["total-position-deletes"] == "2"
