@@ -73,6 +73,10 @@ back, and it is deleted from Zamboni in the change that adopts the patch.
 | A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | `ReplaceCommitter`'s table-level `expected_snapshot_id` guard in `committer.py` |
 | A manifest can be written with `content: deletes` (`write_manifest`, `ManifestWriterV2`) | ELT-1118 — see below | `_DeleteManifestWriter` in `testing.py` |
 | Positional delete files can be written, and `pos` is typed `long` as the spec requires (`write_positional_deletes`, `POSITIONAL_DELETE_SCHEMA`) | ELT-1121 — see below | the hand-written delete Parquet in `testing.py` |
+| Delete files are committed into delete manifests rather than data manifests (`_manifests`, `new_manifest_writer`) | ELT-1124 — see below | `_AppendDeleteFiles` in `testing.py` |
+
+Those three together are what let PyIceberg write a merge-on-read table at all: five rows, a delete
+file naming two positions, and a scan that returns the other three.
 
 ### The delete-manifest patch broadens this branch, deliberately
 
