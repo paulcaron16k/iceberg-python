@@ -739,6 +739,14 @@ class _DeleteFiles(_SnapshotProducer["_DeleteFiles"]):
 
 
 class _FastAppendFiles(_SnapshotProducer["_FastAppendFiles"]):
+    def append_data_file(self, data_file: DataFile) -> _SnapshotProducer[_FastAppendFiles]:
+        # An append declares that only data files were added, so an incremental reader takes it as
+        # pure growth and would never apply a delete file committed under it. Appends also skip
+        # validation, and a delete file is only correct while the data file it names still exists.
+        if data_file.content != DataFileContent.DATA:
+            raise ValueError(f"An append cannot add {data_file.content.name} files; commit delete files with an overwrite")
+        return super().append_data_file(data_file)
+
     def _validate_concurrency(self) -> None:
         """Skip validation; appends do not conflict with other operations."""
 
