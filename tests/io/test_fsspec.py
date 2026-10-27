@@ -19,6 +19,7 @@ import os
 import pickle
 import tempfile
 import threading
+import time
 import uuid
 from typing import Any
 from unittest import mock
@@ -1224,3 +1225,131 @@ def test_s3v4_rest_signer_uses_auth_manager(requests_mock: Mocker) -> None:
     assert requests_mock.last_request is not None
     assert requests_mock.last_request.headers["Authorization"] == "Bearer via-manager"
     assert request.url == new_uri
+
+
+SIGNER_EVENT = "before-sign.s3"
+SIGNER_UNIQUE_ID = 1925
+
+
+def _signer_properties() -> Properties:
+    return {"s3.signer": "S3V4RestSigner", "uri": TEST_URI, "token": "abc", "s3.region": "us-east-1"}
+
+
+def _signer_installed(emitter: Any) -> bool:
+    return any(isinstance(handler, S3V4RestSigner) for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT))
+
+
+def test_s3_leaves_a_signer_installed_while_reconfiguring_a_shared_client() -> None:
+    """`_s3()` must never leave the shared event emitter without a signer.
+
+    fsspec caches `S3FileSystem`, so the botocore client and its event emitter are shared by
+    every thread, and `_s3()` sets `signature_version=UNSIGNED`. A request signed while no
+    handler is installed is therefore sent with no `Authorization` header, and the store
+    answers 403.
+    """
+    fs = fsspec._s3(_signer_properties())
+    emitter = fs.s3.meta.events
+    real_unregister = emitter.unregister
+    installed: list[bool] = []
+
+    def watched_unregister(*args: Any, **kwargs: Any) -> None:
+        real_unregister(*args, **kwargs)
+        installed.append(_signer_installed(emitter))
+
+    with mock.patch.object(emitter, "unregister", watched_unregister):
+        fsspec._s3(_signer_properties())
+
+    # Asserted as well as the window, so the test still says something if a future `_s3()`
+    # stops touching this emitter at all -- otherwise it would pass on an empty observation
+    # list for reasons unrelated to the defect.
+    assert _signer_installed(emitter), "a signer must be installed once _s3() returns"
+    assert all(installed), (
+        f"_s3() left the shared signing emitter with no handler ({installed.count(False)} of {len(installed)} observations)"
+    )
+
+
+def test_the_signer_stays_installed_while_another_thread_reconfigures_s3() -> None:
+    """The same defect under concurrency, which is how production reaches it.
+
+    `FsspecFileIO.get_fs` caches per thread and every table gets its own `FileIO`, so a short
+    workload makes hundreds of `_s3()` calls against the one shared emitter, any of which can
+    open the window under a thread that is signing.
+
+    The window is two adjacent statements, so sampling for it blind is a coin flip -- 20,000
+    observations against an unmodified `_s3()` caught it zero times. It is held open here by
+    delaying the *re-registration* only: the `unregister` that opens it, the emitter, and the
+    thread that observes it are all real, and dropping the `unregister` closes the window
+    whatever the delay. Timing is made deterministic; the defect is not manufactured.
+    """
+    fs = fsspec._s3(_signer_properties())
+    emitter = fs.s3.meta.events
+    real_register_last = emitter.register_last
+
+    def slow_register_last(*args: Any, **kwargs: Any) -> None:
+        time.sleep(0.05)
+        real_register_last(*args, **kwargs)
+
+    observations: list[bool] = []
+    stop = threading.Event()
+
+    def observe() -> None:
+        while not stop.is_set():
+            observations.append(_signer_installed(emitter))
+            time.sleep(0.001)
+
+    watcher = threading.Thread(target=observe, daemon=True)
+    watcher.start()
+    try:
+        with mock.patch.object(emitter, "register_last", slow_register_last):
+            fsspec._s3(_signer_properties())
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    missing = observations.count(False)
+    assert missing == 0, (
+        f"{missing} of {len(observations)} observations from another thread found the shared "
+        "emitter with no signer installed; a request signed at that moment is sent unsigned"
+    )
+
+
+def _installed_signers(emitter: Any) -> list[S3V4RestSigner]:
+    return [handler for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT) if isinstance(handler, S3V4RestSigner)]
+
+
+def test_s3_signs_each_table_through_its_own_signer_endpoint() -> None:
+    """Tables with different signer endpoints must not sign through each other's (#2005).
+
+    Without replacing the handler, the signer registered first would otherwise keep signing for
+    every later table, since registering under an existing unique_id is a no-op.
+    """
+    first = fsspec._s3({**_signer_properties(), "s3.signer.endpoint": "v1/first/sign"})
+    second = fsspec._s3({**_signer_properties(), "s3.signer.endpoint": "v1/second/sign"})
+
+    assert first is not second
+    first_signers = _installed_signers(first.s3.meta.events)
+    second_signers = _installed_signers(second.s3.meta.events)
+    assert [signer.properties["s3.signer.endpoint"] for signer in first_signers] == ["v1/first/sign"]
+    assert [signer.properties["s3.signer.endpoint"] for signer in second_signers] == ["v1/second/sign"]
+
+
+def test_s3_shares_one_client_between_identical_signer_properties() -> None:
+    first = fsspec._s3(_signer_properties())
+    second = fsspec._s3(_signer_properties())
+
+    assert first is second
+    assert len(_installed_signers(first.s3.meta.events)) == 1
+
+
+def test_s3_does_not_retain_signer_secrets_in_the_cache_key() -> None:
+    fs = fsspec._s3({**_signer_properties(), "token": "not-a-hex-secret"})
+
+    assert "not-a-hex-secret" not in repr(fs.storage_options)
+
+
+def test_s3_keeps_the_signer_when_the_client_is_recreated() -> None:
+    """s3fs recreates its client on refresh, and when its connection pool has closed."""
+    fs = fsspec._s3(_signer_properties())
+    fs.connect(refresh=True)
+
+    assert len(_installed_signers(fs.s3.meta.events)) == 1

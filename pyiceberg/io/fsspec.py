@@ -18,6 +18,7 @@
 
 import abc
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -168,6 +169,32 @@ class S3V4RestSigner(S3RequestSigner):
 SIGNERS: dict[str, type[S3RequestSigner]] = {"S3V4RestSigner": S3V4RestSigner}
 
 
+def _signer_cache_key(properties: Properties) -> str:
+    """Return a digest identifying the signer built from these properties, without retaining the secrets in them."""
+    items = sorted((key, repr(value)) for key, value in properties.items())
+    return hashlib.sha256(repr(items).encode()).hexdigest()
+
+
+@lru_cache
+def _signed_s3_filesystem() -> type[AbstractFileSystem]:
+    from s3fs import S3FileSystem
+
+    class SignedS3FileSystem(S3FileSystem):
+        """An S3FileSystem whose clients are created from a session carrying a request signer.
+
+        fsspec caches filesystems by their constructor arguments. The session is a new object on every
+        call, so it is left out of that key, and `signer_key` stands in for the signer it carries. Tables
+        signed through different endpoints therefore get separate clients, and identical ones share one.
+        """
+
+        _strip_tokenize_options = ("session",)
+
+        def __init__(self, *args: Any, signer_key: str, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+
+    return SignedS3FileSystem
+
+
 def _file(_: Properties) -> LocalFileSystem:
     return LocalFileSystem(auto_mkdir=True)
 
@@ -234,13 +261,20 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     if s3_additional_kwargs:
         s3_fs_kwargs["s3_additional_kwargs"] = s3_additional_kwargs
 
-    fs = S3FileSystem(**s3_fs_kwargs)
+    if not register_events:
+        return S3FileSystem(**s3_fs_kwargs)
 
+    # The signer goes on the session rather than on a client: s3fs creates every client, including
+    # the ones it recreates on refresh, from the session it is given, so none is ever without the
+    # signer. Replacing the signer on a shared client instead leaves a window in which requests from
+    # other threads go out unsigned.
+    from aiobotocore.session import AioSession
+
+    session = AioSession()
     for event_name, event_function in register_events.items():
-        fs.s3.meta.events.unregister(event_name, unique_id=1925)
-        fs.s3.meta.events.register_last(event_name, event_function, unique_id=1925)
+        session.get_component("event_emitter").register_last(event_name, event_function, unique_id=1925)
 
-    return fs
+    return _signed_s3_filesystem()(**s3_fs_kwargs, session=session, signer_key=_signer_cache_key(properties))
 
 
 def _gs(properties: Properties) -> AbstractFileSystem:
