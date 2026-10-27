@@ -96,8 +96,9 @@ described above.
 | Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` |
 | A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | `ReplaceCommitter`'s table-level `expected_snapshot_id` guard in `committer.py` |
 | A manifest can be written with `content: deletes` (`write_manifest`, `ManifestWriterV2`) | ELT-1118 — see below | `_DeleteManifestWriter` in `testing.py` |
-| Positional delete files can be written, and `pos` is typed `long` as the spec requires (`write_positional_deletes`, `POSITIONAL_DELETE_SCHEMA`) | ELT-1121 — see below | the hand-written delete Parquet in `testing.py` |
+| Positional delete files can be written, with `pos` typed `long` and both columns required, as the spec requires (`write_positional_deletes`, `POSITIONAL_DELETE_SCHEMA`) | ELT-1121 — see below | the hand-written delete Parquet in `testing.py` |
 | Delete files are committed into delete manifests rather than data manifests (`_manifests`, `new_manifest_writer`) | ELT-1124 — see below | `_AppendDeleteFiles` in `testing.py` |
+| Delete files are committed with an overwrite, never an append, and are refused if a data file they name was concurrently rewritten (`_FastAppendFiles.append_data_file`, `_validate_referenced_data_files_exist`) | TBD | TBD |
 | The S3 remote signer is registered on the session, once per signer: concurrent writes no longer go out unsigned (403), and each table signs through its own endpoint (`_s3`, `_signed_s3_filesystem`) | TBD | TBD: no `_s3()` override found in Zamboni |
 
 Those three together are what let PyIceberg write a merge-on-read table at all: five rows, a delete
