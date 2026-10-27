@@ -805,8 +805,12 @@ MANIFEST_LIST_FILE_STRUCTS = {format_version: schema.as_struct() for format_vers
 
 # The spec types ``pos`` as a ``long``: "Ordinal position of a deleted row ... starting at 0", with
 # no upper bound beyond the row count of the data file it references. Declaring it ``int`` caps a
-# referenced file at 2^31 rows and disagrees with what every other implementation writes.
-POSITIONAL_DELETE_SCHEMA = Schema(NestedField(2147483546, "file_path", StringType()), NestedField(2147483545, "pos", LongType()))
+# referenced file at 2^31 rows and disagrees with what every other implementation writes. Both
+# columns are required by the spec.
+POSITIONAL_DELETE_SCHEMA = Schema(
+    NestedField(2147483546, "file_path", StringType(), required=True),
+    NestedField(2147483545, "pos", LongType(), required=True),
+)
 
 
 class ManifestFile(Record):

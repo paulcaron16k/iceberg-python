@@ -1006,7 +1006,7 @@ def test_a_committed_positional_delete_file_removes_its_rows(deletable_table: Ta
     )
 
     with deletable_table.transaction() as txn:
-        with txn.update_snapshot().fast_append() as producer:
+        with txn.update_snapshot().overwrite() as producer:
             producer.append_data_file(delete_file)
 
     assert [row["id"] for row in deletable_table.scan().to_arrow().to_pylist()] == [1, 3, 5]
@@ -1023,7 +1023,7 @@ def test_a_delete_file_is_committed_into_its_own_manifest(deletable_table: Table
     delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 0)])
 
     with deletable_table.transaction() as txn:
-        with txn.update_snapshot().fast_append() as producer:
+        with txn.update_snapshot().overwrite() as producer:
             producer.append_data_file(delete_file)
 
     snapshot = deletable_table.current_snapshot()
@@ -1050,7 +1050,7 @@ def test_committing_a_delete_file_is_counted_in_the_snapshot_summary(deletable_t
     )
 
     with deletable_table.transaction() as txn:
-        with txn.update_snapshot().fast_append() as producer:
+        with txn.update_snapshot().overwrite() as producer:
             producer.append_data_file(delete_file)
 
     snapshot = deletable_table.current_snapshot()
@@ -1060,3 +1060,103 @@ def test_committing_a_delete_file_is_counted_in_the_snapshot_summary(deletable_t
     assert summary["added-position-deletes"] == "2"
     assert summary["added-delete-files"] == "1"
     assert summary["total-position-deletes"] == "2"
+
+
+def test_an_upsert_commits_data_and_delete_files_into_separate_manifests(deletable_table: Table) -> None:
+    """A row delta adds a replacement data file and a delete file in one snapshot.
+
+    Grouping the added files by spec alone puts the replacement into the delete manifest, where an
+    engine reading data files from data manifests never finds it.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1)])
+    replacement = list(
+        _dataframe_to_data_files(
+            table_metadata=deletable_table.metadata,
+            df=pa.table({"id": pa.array([20], type=pa.int64())}),
+            io=deletable_table.io,
+        )
+    )
+
+    with deletable_table.transaction() as txn:
+        with txn.update_snapshot().overwrite() as producer:
+            for added_file in (*replacement, delete_file):
+                producer.append_data_file(added_file)
+
+    snapshot = deletable_table.current_snapshot()
+    assert snapshot is not None
+    assert snapshot.summary is not None
+    assert snapshot.summary.operation == Operation.OVERWRITE
+    added = {
+        ManifestContent(manifest.content).name: [
+            entry.data_file.content for entry in manifest.fetch_manifest_entry(deletable_table.io)
+        ]
+        for manifest in snapshot.manifests(deletable_table.io)
+        if manifest.added_snapshot_id == snapshot.snapshot_id
+    }
+    assert added == {"DATA": [DataFileContent.DATA], "DELETES": [DataFileContent.POSITION_DELETES]}
+    assert sorted(row["id"] for row in deletable_table.scan().to_arrow().to_pylist()) == [1, 3, 4, 5, 20]
+
+
+def test_an_append_refuses_a_delete_file(deletable_table: Table) -> None:
+    """An append declares that only data was added, so a reader would never apply its deletes."""
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1)])
+
+    for append in ("fast_append", "merge_append"):
+        with deletable_table.transaction() as txn:
+            producer = getattr(txn.update_snapshot(), append)()
+            with pytest.raises(ValueError, match="An append cannot add POSITION_DELETES files"):
+                producer.append_data_file(delete_file)
+
+    assert [row["id"] for row in deletable_table.scan().to_arrow().to_pylist()] == [1, 2, 3, 4, 5]
+
+
+def test_a_delete_file_is_refused_when_its_data_file_was_rewritten(catalog: Catalog, deletable_table: Table) -> None:
+    """A delete file names rows by file and position, so it is only correct while that file exists.
+
+    If compaction rewrites the file first, committing the delete anyway lets the row it deletes
+    survive in the rewritten file. PyIceberg retries a commit by replaying it onto the new head, so
+    this must be checked at commit time rather than when the positions were resolved.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1)])
+
+    tx = deletable_table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.append_data_file(delete_file)
+
+    # Compaction rewrites the data file the delete refers to while the delete is in flight.
+    other = catalog.load_table(deletable_table.name())
+    rewritten = _write_data_file(other, other.scan().to_arrow())
+    with other.transaction() as other_tx:
+        with other_tx.update_snapshot().overwrite() as rewrite:
+            rewrite.delete_data_file(data_file)
+            rewrite.append_data_file(rewritten)
+
+    with pytest.raises(ValidationException, match=re.escape(data_file.file_path)):
+        update.commit()
+        tx.commit_transaction()
+
+
+def test_a_delete_file_still_commits_beside_an_unrelated_append(catalog: Catalog, deletable_table: Table) -> None:
+    """Only the data files a delete names can invalidate it; a concurrent append cannot."""
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1)])
+
+    tx = deletable_table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.append_data_file(delete_file)
+
+    catalog.load_table(deletable_table.name()).append(pa.table({"id": pa.array([6], type=pa.int64())}))
+
+    update.commit()
+    tx.commit_transaction()
+
+    assert sorted(row["id"] for row in catalog.load_table(deletable_table.name()).scan().to_arrow().to_pylist()) == [
+        1,
+        3,
+        4,
+        5,
+        6,
+    ]

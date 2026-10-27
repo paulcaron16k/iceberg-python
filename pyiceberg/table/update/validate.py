@@ -30,7 +30,7 @@ from pyiceberg.manifest import (
 )
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
-from pyiceberg.table.delete_file_index import DeleteFileIndex
+from pyiceberg.table.delete_file_index import PATH_FIELD_ID, DeleteFileIndex
 from pyiceberg.table.snapshots import Operation, Snapshot, ancestors_between
 from pyiceberg.typedef import Record
 
@@ -221,6 +221,59 @@ def _validate_data_files_exist(
     }
     if conflicting_paths:
         raise ValidationException(f"Data files were concurrently deleted: {sorted(conflicting_paths)}")
+
+
+def _referenced_path_range(delete_file: DataFile) -> tuple[str, str] | None:
+    """Return the lowest and highest data file path a position delete file names, if its bounds record them."""
+    lower = (delete_file.lower_bounds or {}).get(PATH_FIELD_ID)
+    upper = (delete_file.upper_bounds or {}).get(PATH_FIELD_ID)
+    if lower is None or upper is None:
+        return None
+    return lower.decode("utf-8"), upper.decode("utf-8")
+
+
+def _validate_referenced_data_files_exist(
+    table: Table,
+    starting_snapshot: Snapshot,
+    delete_files: list[DataFile],
+    parent_snapshot: Snapshot | None,
+) -> None:
+    """Validate that the data files named by position delete files have not been concurrently deleted.
+
+    A position delete names rows by data file and position, so it removes nothing once that file has
+    been rewritten. A deleted data file conflicts when its path falls within a delete file's path
+    bounds, or when the delete file records no bounds, anywhere in the same partition. Matching on
+    the range rather than every referenced path errs towards a conflict, which costs a retry.
+
+    Args:
+        table: Table to validate
+        starting_snapshot: Snapshot at the end of the validation window
+        delete_files: Position delete files being committed
+        parent_snapshot: Snapshot at the start of the validation window, excluded from the scan
+    """
+    partition_set: dict[int, set[Record]] = defaultdict(set)
+    for delete_file in delete_files:
+        partition_set[delete_file.spec_id].add(delete_file.partition)
+
+    def _referenced(entry: ManifestEntry) -> bool:
+        path = entry.data_file.file_path
+        for delete_file in delete_files:
+            if delete_file.spec_id != entry.data_file.spec_id or delete_file.partition != entry.data_file.partition:
+                continue
+            path_range = _referenced_path_range(delete_file)
+            if path_range is None or path_range[0] <= path <= path_range[1]:
+                return True
+        return False
+
+    conflicting_paths = {
+        entry.data_file.file_path
+        for entry in _deleted_data_files(table, starting_snapshot, None, partition_set, parent_snapshot)
+        if _referenced(entry)
+    }
+    if conflicting_paths:
+        raise ValidationException(
+            f"Data files referenced by position deletes were concurrently deleted: {sorted(conflicting_paths)}"
+        )
 
 
 def _added_data_files(

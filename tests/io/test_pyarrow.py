@@ -6148,6 +6148,18 @@ def test_write_positional_deletes_writes_pos_as_a_long(tmp_path: Path) -> None:
         assert pq.read_table(fi).schema.field("pos").type == pa.int64()
 
 
+def test_write_positional_deletes_writes_both_columns_as_required(tmp_path: Path) -> None:
+    """The spec declares ``file_path`` and ``pos`` required, so neither may be written as nullable."""
+    table, data_file = _table_with_one_data_file(tmp_path)
+
+    delete_file = write_positional_deletes(table.io, table.metadata, [(data_file.file_path, 1)])
+
+    with table.io.new_input(delete_file.file_path).open() as fi:
+        schema = pq.read_table(fi).schema
+    assert not schema.field("file_path").nullable
+    assert not schema.field("pos").nullable
+
+
 def test_write_positional_deletes_writes_the_file_path_bounds_in_full(tmp_path: Path) -> None:
     """Truncated bounds are not merely imprecise here — they lose the referenced file.
 
