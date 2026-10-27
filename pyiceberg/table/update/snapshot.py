@@ -519,6 +519,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             _validate_deleted_data_files,
             _validate_no_new_delete_files,
             _validate_no_new_deletes_for_data_files,
+            _validate_referenced_data_files_exist,
         )
 
         if self._commit_window is None or self._commit_window.is_empty():
@@ -558,6 +559,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             # (as Java does) when delete-file write support lands.
             _validate_no_new_delete_files(table, catalog_head, conflict_detection_filter, None, starting_snapshot)
             _validate_deleted_data_files(table, catalog_head, conflict_detection_filter, starting_snapshot)
+
+        if position_deletes := [f for f in self._added_data_files if f.content == DataFileContent.POSITION_DELETES]:
+            _validate_referenced_data_files_exist(table, catalog_head, position_deletes, starting_snapshot)
 
         if self._deleted_data_files:
             _validate_data_files_exist(table, catalog_head, self._deleted_data_files, starting_snapshot)

@@ -1080,15 +1080,17 @@ def test_an_upsert_commits_data_and_delete_files_into_separate_manifests(deletab
 
     with deletable_table.transaction() as txn:
         with txn.update_snapshot().overwrite() as producer:
-            for added in (*replacement, delete_file):
-                producer.append_data_file(added)
+            for added_file in (*replacement, delete_file):
+                producer.append_data_file(added_file)
 
     snapshot = deletable_table.current_snapshot()
     assert snapshot is not None
     assert snapshot.summary is not None
     assert snapshot.summary.operation == Operation.OVERWRITE
     added = {
-        ManifestContent(manifest.content).name: [entry.data_file.content for entry in manifest.fetch_manifest_entry(deletable_table.io)]
+        ManifestContent(manifest.content).name: [
+            entry.data_file.content for entry in manifest.fetch_manifest_entry(deletable_table.io)
+        ]
         for manifest in snapshot.manifests(deletable_table.io)
         if manifest.added_snapshot_id == snapshot.snapshot_id
     }
@@ -1108,3 +1110,53 @@ def test_an_append_refuses_a_delete_file(deletable_table: Table) -> None:
                 producer.append_data_file(delete_file)
 
     assert [row["id"] for row in deletable_table.scan().to_arrow().to_pylist()] == [1, 2, 3, 4, 5]
+
+
+def test_a_delete_file_is_refused_when_its_data_file_was_rewritten(catalog: Catalog, deletable_table: Table) -> None:
+    """A delete file names rows by file and position, so it is only correct while that file exists.
+
+    If compaction rewrites the file first, committing the delete anyway lets the row it deletes
+    survive in the rewritten file. PyIceberg retries a commit by replaying it onto the new head, so
+    this must be checked at commit time rather than when the positions were resolved.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1)])
+
+    tx = deletable_table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.append_data_file(delete_file)
+
+    # Compaction rewrites the data file the delete refers to while the delete is in flight.
+    other = catalog.load_table(deletable_table.name())
+    rewritten = _write_data_file(other, other.scan().to_arrow())
+    with other.transaction() as other_tx:
+        with other_tx.update_snapshot().overwrite() as rewrite:
+            rewrite.delete_data_file(data_file)
+            rewrite.append_data_file(rewritten)
+
+    with pytest.raises(ValidationException, match=re.escape(data_file.file_path)):
+        update.commit()
+        tx.commit_transaction()
+
+
+def test_a_delete_file_still_commits_beside_an_unrelated_append(catalog: Catalog, deletable_table: Table) -> None:
+    """Only the data files a delete names can invalidate it; a concurrent append cannot."""
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    delete_file = write_positional_deletes(deletable_table.io, deletable_table.metadata, [(data_file.file_path, 1)])
+
+    tx = deletable_table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.append_data_file(delete_file)
+
+    catalog.load_table(deletable_table.name()).append(pa.table({"id": pa.array([6], type=pa.int64())}))
+
+    update.commit()
+    tx.commit_transaction()
+
+    assert sorted(row["id"] for row in catalog.load_table(deletable_table.name()).scan().to_arrow().to_pylist()) == [
+        1,
+        3,
+        4,
+        5,
+        6,
+    ]
