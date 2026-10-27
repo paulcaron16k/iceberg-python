@@ -75,8 +75,11 @@ the form that can get there. An override in Zamboni is not. When a release
 carries the change, Zamboni raises its minimum PyIceberg and drops the override,
 and the patch leaves this branch (see "Retiring a patch").
 
-The patches are written in upstream's own style and tested with upstream's own
-fixtures for that reason: so they stay reviewable and rebasable.
+**Nothing here is proposed upstream at this time. At some point in the future
+(date TBD), an effort to push our bug fixes and enhancements upstream will be
+started. This is why we maintain separate branches for each one.** The patches
+are written in upstream's own style and tested with upstream's own fixtures for
+the same reason: so they stay reviewable and rebasable until then.
 
 Keeping them separate is what lets each override move independently, and what
 would let any of them be dropped if upstream ever implements the same thing.
