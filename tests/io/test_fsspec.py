@@ -1311,3 +1311,45 @@ def test_the_signer_stays_installed_while_another_thread_reconfigures_s3() -> No
         f"{missing} of {len(observations)} observations from another thread found the shared "
         "emitter with no signer installed; a request signed at that moment is sent unsigned"
     )
+
+
+def _installed_signers(emitter: Any) -> list[S3V4RestSigner]:
+    return [handler for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT) if isinstance(handler, S3V4RestSigner)]
+
+
+def test_s3_signs_each_table_through_its_own_signer_endpoint() -> None:
+    """Tables with different signer endpoints must not sign through each other's (#2005).
+
+    Without replacing the handler, the signer registered first would otherwise keep signing for
+    every later table, since registering under an existing unique_id is a no-op.
+    """
+    first = fsspec._s3({**_signer_properties(), "s3.signer.endpoint": "v1/first/sign"})
+    second = fsspec._s3({**_signer_properties(), "s3.signer.endpoint": "v1/second/sign"})
+
+    assert first is not second
+    first_signers = _installed_signers(first.s3.meta.events)
+    second_signers = _installed_signers(second.s3.meta.events)
+    assert [signer.properties["s3.signer.endpoint"] for signer in first_signers] == ["v1/first/sign"]
+    assert [signer.properties["s3.signer.endpoint"] for signer in second_signers] == ["v1/second/sign"]
+
+
+def test_s3_shares_one_client_between_identical_signer_properties() -> None:
+    first = fsspec._s3(_signer_properties())
+    second = fsspec._s3(_signer_properties())
+
+    assert first is second
+    assert len(_installed_signers(first.s3.meta.events)) == 1
+
+
+def test_s3_does_not_retain_signer_secrets_in_the_cache_key() -> None:
+    fs = fsspec._s3({**_signer_properties(), "token": "not-a-hex-secret"})
+
+    assert "not-a-hex-secret" not in repr(fs.storage_options)
+
+
+def test_s3_keeps_the_signer_when_the_client_is_recreated() -> None:
+    """s3fs recreates its client on refresh, and when its connection pool has closed."""
+    fs = fsspec._s3(_signer_properties())
+    fs.connect(refresh=True)
+
+    assert len(_installed_signers(fs.s3.meta.events)) == 1
