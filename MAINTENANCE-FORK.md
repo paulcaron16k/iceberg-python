@@ -35,9 +35,19 @@ Both were measured on 2026-09-09 before choosing:
 
 **The base is pinned, not tracked.** "Off `main`" here means "off one commit of
 `main`, advanced deliberately". Nothing consumes this branch by name: consumers
-pin a commit SHA, so a rebase is a decision someone makes rather than something
-that happens to a deploy. That is also what makes the dependency reproducible,
-which a path dependency to a sibling checkout never was.
+pin a tag (or, before tags, a commit SHA), so a rebase is a decision someone
+makes rather than something that happens to a deploy. That is also what makes
+the dependency reproducible, which a path dependency to a sibling checkout never
+was.
+
+**Tags name the states consumers adopt.** Each state of this branch that a
+consumer pins gets an annotated tag `maintenance/YYYY-MM-DD` (with `.2`, `.3`
+for a second state the same day), pushed to this fork only. A tag is never
+moved or deleted: a rebase rewrites the branch, and the tag keeps every adopted
+state reachable, which a bare SHA does not. The tag pins only development, CI and
+tests; production installs of either consumer use the released PyIceberg and
+their mirrors. `maintenance/base-9299bdb8` predates the convention and only keeps
+Zamboni's old SHA pin reachable.
 
 ## How a patch gets here
 
