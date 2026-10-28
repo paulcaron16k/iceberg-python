@@ -158,6 +158,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     _predicate: BooleanExpression
     _case_sensitive: bool
     _commit_window: CommitWindow | None
+    _conflict_detection_filter: BooleanExpression | None
     _written_manifests: list[str]
     _uncommitted_manifests: list[str]
     _written_manifest_lists: list[str]
@@ -195,6 +196,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._predicate = AlwaysFalse()
         self._case_sensitive = True
         self._commit_window = None
+        self._conflict_detection_filter = None
         self._isolation_operation: Operation = Operation.DELETE
 
     def _validate_target_branch(self, branch: str | None) -> str | None:
@@ -560,6 +562,9 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             _validate_no_new_delete_files(table, catalog_head, conflict_detection_filter, None, starting_snapshot)
             _validate_deleted_data_files(table, catalog_head, conflict_detection_filter, starting_snapshot)
 
+        if self._conflict_detection_filter is not None:
+            _validate_added_data_files(table, catalog_head, self._conflict_detection_filter, starting_snapshot)
+
         if position_deletes := [f for f in self._added_data_files if f.content == DataFileContent.POSITION_DELETES]:
             _validate_referenced_data_files_exist(table, catalog_head, position_deletes, starting_snapshot)
 
@@ -840,6 +845,23 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
 
     Data and delete files were added and removed in a logical overwrite operation.
     """
+
+    def validate_no_conflicting_data_files(self, conflict_detection_filter: BooleanExpression) -> _OverwriteFiles:
+        """Refuse the commit if a data file added since the base snapshot could hold rows matching the filter.
+
+        A merge-on-read upsert resolves its matches against the base snapshot. Replayed onto a head
+        where another writer has added a row with the same key, it would commit a second row for that
+        key. Java's ``RowDelta.validateNoConflictingDataFiles`` makes the same check, and leaves the
+        decision to request it to the caller.
+
+        Args:
+            conflict_detection_filter: Rows the operation read, such as the upsert's match filter.
+
+        Returns:
+            This producer, for chaining.
+        """
+        self._conflict_detection_filter = conflict_detection_filter
+        return self
 
     def _existing_manifests(self) -> list[ManifestFile]:
         """Determine if there are any existing manifest files."""
