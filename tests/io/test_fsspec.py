@@ -15,12 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import gc
 import os
 import pickle
 import tempfile
 import threading
 import time
 import uuid
+import weakref
 from typing import Any
 from unittest import mock
 
@@ -1345,6 +1347,27 @@ def test_s3_does_not_retain_signer_secrets_in_the_cache_key() -> None:
     fs = fsspec._s3({**_signer_properties(), "token": "not-a-hex-secret"})
 
     assert "not-a-hex-secret" not in repr(fs.storage_options)
+
+
+def test_s3_releases_a_signed_filesystem_no_table_uses() -> None:
+    """fsspec's instance cache kept every signed filesystem until exit.
+
+    With it went the client, the signer and what the signer holds: three open sockets for every catalog
+    and table in a long-lived process. The client is closed on fsspec's loop thread after the filesystem
+    goes, so the signer is waited for rather than expected at once.
+    """
+    fs = fsspec._s3(_signer_properties())
+    filesystem = weakref.ref(fs)
+    (signer,) = [weakref.ref(s) for s in _installed_signers(fs.s3.meta.events)]
+    del fs
+
+    deadline = time.monotonic() + 5
+    while (filesystem() is not None or signer() is not None) and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.05)
+
+    assert filesystem() is None, "nothing uses the filesystem, but something still holds it"
+    assert signer() is None, "the filesystem went, but its signer stayed"
 
 
 def test_s3_keeps_the_signer_when_the_client_is_recreated() -> None:
