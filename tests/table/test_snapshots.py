@@ -28,11 +28,12 @@ import pytest
 from pyiceberg import __version__
 from pyiceberg.catalog import Catalog
 from pyiceberg.exceptions import ValidationException
+from pyiceberg.expressions import EqualTo
 from pyiceberg.io.pyarrow import _dataframe_to_data_files, write_positional_deletes
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table import Table
+from pyiceberg.table import Table, Transaction
 from pyiceberg.table.snapshots import (
     Operation,
     Snapshot,
@@ -46,6 +47,7 @@ from pyiceberg.table.snapshots import (
     latest_ancestor_before_timestamp,
     update_snapshot_summaries,
 )
+from pyiceberg.table.update.snapshot import _OverwriteFiles
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.typedef import Record
 from pyiceberg.types import (
@@ -1159,4 +1161,66 @@ def test_a_delete_file_still_commits_beside_an_unrelated_append(catalog: Catalog
         4,
         5,
         6,
+    ]
+
+
+def _stage_upsert(table: Table, data_file: DataFile, key: int, position: int) -> tuple[Transaction, _OverwriteFiles]:
+    """Stage a merge-on-read upsert of one key: delete its row by position and add its replacement."""
+    delete_file = write_positional_deletes(table.io, table.metadata, [(data_file.file_path, position)])
+    replacement = _write_data_file(table, pa.table({"id": pa.array([key], type=pa.int64())}))
+
+    tx = table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.validate_no_conflicting_data_files(EqualTo("id", key))
+    update.append_data_file(replacement)
+    update.append_data_file(delete_file)
+    return tx, update
+
+
+def test_an_upsert_is_refused_when_a_concurrent_writer_added_the_same_key(catalog: Catalog, deletable_table: Table) -> None:
+    """Two upserts of one key both resolve against the same base, so each deletes the original row.
+
+    Replaying the second onto the first would keep both replacement rows. Only the data file the
+    first writer added can show the conflict: the data file both delete still exists.
+    """
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    tx, update = _stage_upsert(deletable_table, data_file, key=3, position=2)
+
+    other = catalog.load_table(deletable_table.name())
+    other_tx, other_update = _stage_upsert(other, data_file, key=3, position=2)
+    other_update.commit()
+    other_tx.commit_transaction()
+
+    with pytest.raises(ValidationException, match="Added data files were found matching the filter"):
+        update.commit()
+        tx.commit_transaction()
+
+    assert sorted(row["id"] for row in catalog.load_table(deletable_table.name()).scan().to_arrow().to_pylist()) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
+
+def test_an_upsert_still_commits_beside_a_concurrent_upsert_of_another_key(catalog: Catalog, deletable_table: Table) -> None:
+    """The filter scopes the check to the upsert's own keys, so writers on disjoint keys do not conflict."""
+    data_file = next(iter(deletable_table.scan().plan_files())).file
+    tx, update = _stage_upsert(deletable_table, data_file, key=3, position=2)
+
+    other = catalog.load_table(deletable_table.name())
+    other_tx, other_update = _stage_upsert(other, data_file, key=2, position=1)
+    other_update.commit()
+    other_tx.commit_transaction()
+
+    update.commit()
+    tx.commit_transaction()
+
+    assert sorted(row["id"] for row in catalog.load_table(deletable_table.name()).scan().to_arrow().to_pylist()) == [
+        1,
+        2,
+        3,
+        4,
+        5,
     ]
