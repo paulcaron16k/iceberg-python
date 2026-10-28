@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import threading
+import weakref
 from collections.abc import Callable
 from copy import copy
 from functools import lru_cache
@@ -175,6 +176,14 @@ def _signer_cache_key(properties: Properties) -> str:
     return hashlib.sha256(repr(items).encode()).hexdigest()
 
 
+#: The signed filesystems some FileIO still holds, one per signer: tables signed through different endpoints get
+#: separate clients, and identical ones share one. Weak, so a filesystem goes, with its client, its signer and
+#: what the signer holds (an auth manager and its HTTP session), when the last table using it does. fsspec's
+#: instance cache kept them all until exit, three open sockets for every catalog and table.
+_SIGNED_FILESYSTEMS: weakref.WeakValueDictionary[tuple[int, str], AbstractFileSystem] = weakref.WeakValueDictionary()
+_SIGNED_FILESYSTEMS_LOCK = threading.Lock()
+
+
 @lru_cache
 def _signed_s3_filesystem() -> type[AbstractFileSystem]:
     from s3fs import S3FileSystem
@@ -182,15 +191,11 @@ def _signed_s3_filesystem() -> type[AbstractFileSystem]:
     class SignedS3FileSystem(S3FileSystem):
         """An S3FileSystem whose clients are created from a session carrying a request signer.
 
-        fsspec caches filesystems by their constructor arguments. The session is a new object on every
-        call, so it is left out of that key, and `signer_key` stands in for the signer it carries. Tables
-        signed through different endpoints therefore get separate clients, and identical ones share one.
+        Kept out of fsspec's instance cache, which holds every filesystem for the life of the process;
+        `_SIGNED_FILESYSTEMS` shares them instead.
         """
 
-        _strip_tokenize_options = ("session",)
-
-        def __init__(self, *args: Any, signer_key: str, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
+        cachable = False
 
     return SignedS3FileSystem
 
@@ -270,11 +275,19 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     # other threads go out unsigned.
     from aiobotocore.session import AioSession
 
-    session = AioSession()
-    for event_name, event_function in register_events.items():
-        session.get_component("event_emitter").register_last(event_name, event_function, unique_id=1925)
-
-    return _signed_s3_filesystem()(**s3_fs_kwargs, session=session, signer_key=_signer_cache_key(properties))
+    # The pid, as fsspec keys its own cache: a forked child must not reuse a client bound to its parent's
+    # event-loop thread. The digest covers an auth manager by its repr, which carries its address; that
+    # cannot be reused while the filesystem lives, because the filesystem's signer holds it.
+    key = (os.getpid(), _signer_cache_key(properties))
+    with _SIGNED_FILESYSTEMS_LOCK:
+        if (fs := _SIGNED_FILESYSTEMS.get(key)) is not None:
+            return fs
+        session = AioSession()
+        for event_name, event_function in register_events.items():
+            session.get_component("event_emitter").register_last(event_name, event_function, unique_id=1925)
+        fs = _signed_s3_filesystem()(**s3_fs_kwargs, session=session)
+        _SIGNED_FILESYSTEMS[key] = fs
+        return fs
 
 
 def _gs(properties: Properties) -> AbstractFileSystem:
