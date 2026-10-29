@@ -195,7 +195,7 @@ def _signed_s3_filesystem() -> type[AbstractFileSystem]:
         `_SIGNED_FILESYSTEMS` shares them instead.
         """
 
-        cachable = False
+        cachable = False  # codespell:ignore cachable
 
     return SignedS3FileSystem
 
