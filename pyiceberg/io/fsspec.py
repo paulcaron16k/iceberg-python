@@ -17,6 +17,8 @@
 """FileIO implementation for reading and writing table files that uses fsspec compatible filesystems."""
 
 import abc
+import asyncio
+import contextlib
 import errno
 import hashlib
 import json
@@ -183,6 +185,88 @@ def _signer_cache_key(properties: Properties) -> str:
 _SIGNED_FILESYSTEMS: weakref.WeakValueDictionary[tuple[int, str], AbstractFileSystem] = weakref.WeakValueDictionary()
 _SIGNED_FILESYSTEMS_LOCK = threading.Lock()
 
+#: How many signing calls may run at once, process-wide. `S3V4RestSigner` posts with no timeout, so a sign endpoint
+#: that never answers holds a slot for good; ten of them stall all signing, as one stalled the event loop before
+#: signing moved off it. Ten is also `requests`' default pool size, so no signer's session opens a connection only to
+#: discard it.
+_SIGN_THREADS = 10
+#: Taken by each signing thread. Replaced in a forked child, where the parent's in-flight calls never release theirs.
+_SIGN_SLOTS = threading.BoundedSemaphore(_SIGN_THREADS)
+#: Taken on the loop before a signing thread is started, and given back when it finishes, so a batch of requests waits
+#: on the loop rather than as one blocked thread each: fsspec fans a batch out up to `RLIMIT_NOFILE // 8` requests at
+#: once, and 500 pending signs started 500 threads (found by review).
+_SIGN_GATES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _reset_signing_after_fork() -> None:
+    global _SIGN_SLOTS
+    _SIGN_SLOTS = threading.BoundedSemaphore(_SIGN_THREADS)
+    _SIGN_GATES.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_signing_after_fork)
+
+
+class _SignOffTheLoop:
+    """A `before-sign` handler that runs a synchronous signer on a thread of its own.
+
+    aiobotocore runs a synchronous handler inline on the event loop and awaits only an awaitable result
+    (`AioHierarchicalEmitter._emit`). s3fs drives every filesystem from fsspec's one loop thread, so a signer that
+    waits on the network, as `S3V4RestSigner` does, stalled all object-store I/O in the process for each signature.
+    This returns a coroutine instead, so the loop serves other requests while the signer waits. An exception the
+    signer raises is re-raised to the request, which is then not sent.
+
+    A daemon thread per call rather than a `ThreadPoolExecutor`: an executor's workers are joined at exit
+    (`concurrent.futures.thread._python_exit`), so a sign endpoint that never answered would keep a process from
+    exiting. fsspec's loop thread, where signing ran before, is a daemon too.
+    """
+
+    def __init__(self, signer: Callable[..., None]) -> None:
+        self.signer = signer
+
+    async def __call__(self, **kwargs: Any) -> None:
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[None] = loop.create_future()
+        slots = _SIGN_SLOTS
+        if (gate := _SIGN_GATES.get(loop)) is None:
+            gate = _SIGN_GATES[loop] = asyncio.Semaphore(_SIGN_THREADS)
+        await gate.acquire()
+
+        def sign() -> None:
+            outcome: BaseException | None = None
+            try:
+                with slots:
+                    self.signer(**kwargs)
+            except Exception as exc:
+                outcome = exc
+            except BaseException as exc:
+                # Re-raised on fsspec's loop, an interrupt would stop the loop every filesystem shares; dropped, the
+                # request would wait forever. So it fails just this request.
+                outcome = RuntimeError(f"S3 request signer raised {exc!r}")
+                outcome.__cause__ = exc
+            if isinstance(outcome, StopIteration):  # A future refuses one as its exception.
+                outcome = RuntimeError(f"S3 request signer raised {outcome!r}")
+            with contextlib.suppress(RuntimeError):  # The loop has closed, so nobody is waiting.
+                loop.call_soon_threadsafe(_settle_signing, done, outcome, gate)
+
+        try:
+            threading.Thread(target=sign, name="s3-signer", daemon=True).start()
+        except BaseException:
+            gate.release()
+            raise
+        await done
+
+
+def _settle_signing(done: "asyncio.Future[None]", outcome: BaseException | None, gate: asyncio.Semaphore) -> None:
+    gate.release()  # Here rather than when the request ends: a cancelled request's signer is still running.
+    if done.done():  # The request was cancelled while its signer ran.
+        return
+    if outcome is None:
+        done.set_result(None)
+    else:
+        done.set_exception(outcome)
+
 
 @lru_cache
 def _signed_s3_filesystem() -> type[AbstractFileSystem]:
@@ -195,7 +279,7 @@ def _signed_s3_filesystem() -> type[AbstractFileSystem]:
         `_SIGNED_FILESYSTEMS` shares them instead.
         """
 
-        cachable = False
+        cachable = False  # codespell:ignore cachable
 
     return SignedS3FileSystem
 
@@ -216,13 +300,12 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     }
     config_kwargs = {}
     s3_additional_kwargs = {}
-    register_events: dict[str, Callable[[AWSRequest], None]] = {}
+    register_events: dict[str, Callable[..., Any]] = {}
 
     if signer := properties.get(S3_SIGNER):
         logger.info("Loading signer %s", signer)
         if signer_cls := SIGNERS.get(signer):
-            signer = signer_cls(properties)
-            register_events["before-sign.s3"] = signer
+            register_events["before-sign.s3"] = _SignOffTheLoop(signer_cls(properties))
 
             # Disable the AWS Signer
             from botocore import UNSIGNED
