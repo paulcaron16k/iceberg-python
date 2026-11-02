@@ -15,10 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import asyncio
+import concurrent.futures
 import gc
 import os
 import pickle
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import uuid
@@ -1237,8 +1242,13 @@ def _signer_properties() -> Properties:
     return {"s3.signer": "S3V4RestSigner", "uri": TEST_URI, "token": "abc", "s3.region": "us-east-1"}
 
 
+def _signers_on(emitter: Any) -> list[Any]:
+    """The signers registered for `before-sign`, unwrapped from the handler that runs them off the event loop."""
+    return [getattr(handler, "signer", handler) for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT)]
+
+
 def _signer_installed(emitter: Any) -> bool:
-    return any(isinstance(handler, S3V4RestSigner) for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT))
+    return any(isinstance(signer, S3V4RestSigner) for signer in _signers_on(emitter))
 
 
 def test_s3_leaves_a_signer_installed_while_reconfiguring_a_shared_client() -> None:
@@ -1316,7 +1326,7 @@ def test_the_signer_stays_installed_while_another_thread_reconfigures_s3() -> No
 
 
 def _installed_signers(emitter: Any) -> list[S3V4RestSigner]:
-    return [handler for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT) if isinstance(handler, S3V4RestSigner)]
+    return [signer for signer in _signers_on(emitter) if isinstance(signer, S3V4RestSigner)]
 
 
 def test_s3_signs_each_table_through_its_own_signer_endpoint() -> None:
@@ -1376,3 +1386,175 @@ def test_s3_keeps_the_signer_when_the_client_is_recreated() -> None:
     fs.connect(refresh=True)
 
     assert len(_installed_signers(fs.s3.meta.events)) == 1
+
+
+class _ScriptedSigner(fsspec.S3RequestSigner):
+    """A signer that runs `script`, a callable set by each test, instead of calling a sign endpoint."""
+
+    script: Any = None
+
+    def __call__(self, request: AWSRequest, **_: Any) -> None:
+        type(self).script(self.properties["s3.signer.endpoint"])
+
+
+@pytest.fixture
+def scripted_signer() -> Any:
+    """Register `_ScriptedSigner` under a name of its own for the duration of the test."""
+    with mock.patch.dict(fsspec.SIGNERS, {"scripted": _ScriptedSigner}):
+        yield _ScriptedSigner
+    _ScriptedSigner.script = None
+
+
+def _scripted_filesystem(endpoint: str) -> AbstractFileSystem:
+    # Explicit credentials keep botocore from walking its credential chain when it creates the client; the signer
+    # replaces AWS signing, so they are never used.
+    return fsspec._s3(
+        {
+            "s3.signer": "scripted",
+            "s3.signer.endpoint": f"{endpoint}-{uuid.uuid4().hex}",
+            "uri": TEST_URI,
+            "s3.endpoint": "http://localhost.invalid",
+            "s3.region": "us-east-1",
+            "s3.access-key-id": "unused",
+            "s3.secret-access-key": "unused",
+        }
+    )
+
+
+def _presign(fs: Any) -> str:
+    """Sign a request through `fs`'s client, as botocore signs one it sends, without sending anything.
+
+    Bounded, so a request whose signing outcome is lost fails the test instead of hanging it.
+    """
+    from fsspec.asyn import sync
+
+    return sync(fs.loop, fs.s3.generate_presigned_url, "put_object", Params={"Bucket": "b", "Key": "k"}, timeout=10)
+
+
+def test_s3_signs_concurrent_requests_concurrently(scripted_signer: Any) -> None:
+    """A signer that waits must not hold up the other requests on fsspec's event loop.
+
+    Each signer waits at a barrier for the other, so the two only finish if they run at the same time. Signed inline
+    on the loop, as aiobotocore runs a synchronous handler, the first waits alone and the barrier breaks.
+    """
+    barrier = threading.Barrier(2, timeout=5)
+    scripted_signer.script = lambda _: barrier.wait()
+    first, second = _scripted_filesystem("first"), _scripted_filesystem("second")
+
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        urls = list(pool.map(_presign, [first, second]))
+
+    assert len(urls) == 2
+
+
+def test_s3_signing_error_fails_its_request(scripted_signer: Any) -> None:
+    def refuse(_: str) -> None:
+        raise SignError("refused")
+
+    scripted_signer.script = refuse
+
+    with pytest.raises(SignError, match="refused"):
+        _presign(_scripted_filesystem("refused"))
+
+
+def test_s3_pending_signs_wait_on_the_loop_not_as_threads(scripted_signer: Any) -> None:
+    """A batch of requests starts at most `_SIGN_THREADS` signing threads; the rest wait on the loop.
+
+    fsspec fans a batch out up to `RLIMIT_NOFILE // 8` requests at once, and a thread per pending sign started 500
+    threads for 500 requests.
+    """
+    from fsspec.asyn import sync
+
+    peak: list[int] = []
+
+    def count(_: str) -> None:
+        peak.append(sum(thread.name == "s3-signer" for thread in threading.enumerate()))
+        time.sleep(0.02)
+
+    scripted_signer.script = count
+    fs: Any = _scripted_filesystem("batch")
+    fs.s3  # noqa: B018 - the client, built before the batch
+
+    async def batch() -> None:
+        await asyncio.gather(
+            *(fs.s3.generate_presigned_url("put_object", Params={"Bucket": "b", "Key": f"k{i}"}) for i in range(60))
+        )
+
+    sync(fs.loop, batch, timeout=30)
+
+    assert len(peak) == 60
+    # A finished thread hands its slot on just before it exits, so one or two may briefly overlap the next; without
+    # the gate there were as many threads as requests.
+    assert max(peak) < 2 * fsspec._SIGN_THREADS, f"{max(peak)} signing threads at once"
+
+
+def test_s3_signer_interrupt_fails_only_its_request(scripted_signer: Any) -> None:
+    """An interrupt raised by a signer must not stop the event loop every filesystem shares."""
+
+    def interrupt(endpoint: str) -> None:
+        if endpoint.startswith("interrupted"):
+            raise KeyboardInterrupt
+
+    scripted_signer.script = interrupt
+
+    with pytest.raises(RuntimeError, match="KeyboardInterrupt"):
+        _presign(_scripted_filesystem("interrupted"))
+    assert _presign(_scripted_filesystem("after")).startswith("http://localhost.invalid/")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_s3_forked_child_signs_while_parent_holds_every_signing_slot(scripted_signer: Any) -> None:
+    """Slots the parent's in-flight signers hold are never released in a child, where those threads do not exist."""
+    scripted_signer.script = lambda _: None
+    slots = fsspec._SIGN_SLOTS
+    for _ in range(fsspec._SIGN_THREADS):
+        slots.acquire()
+    try:
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - runs in the child
+            code = 1
+            try:
+                worker = threading.Thread(target=lambda: _presign(_scripted_filesystem("child")), daemon=True)
+                worker.start()
+                worker.join(timeout=10)
+                code = 1 if worker.is_alive() else 0
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        for _ in range(fsspec._SIGN_THREADS):
+            slots.release()
+
+    assert os.waitstatus_to_exitcode(status) == 0, "the child could not sign: it inherited its parent's held slots"
+
+
+def test_s3_process_exits_while_a_sign_endpoint_never_answers(tmp_path: Any) -> None:
+    """A sign request with no timeout must not keep the process alive, as a joined executor thread would."""
+    script = tmp_path / "hang.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import threading, time, uuid
+            from pyiceberg.io import fsspec
+            from fsspec.asyn import sync
+
+            class Hang(fsspec.S3RequestSigner):
+                def __call__(self, request, **_):
+                    threading.Event().wait()
+
+            fsspec.SIGNERS["hang"] = Hang
+            fs = fsspec._s3({"s3.signer": "hang", "uri": "http://localhost.invalid", "s3.region": "us-east-1",
+                             "s3.endpoint": "http://localhost.invalid",
+                             "s3.access-key-id": "unused", "s3.secret-access-key": "unused"})
+            threading.Thread(target=lambda: sync(fs.loop, fs.s3.generate_presigned_url, "put_object",
+                                                 Params={"Bucket": "b", "Key": "k"}), daemon=True).start()
+            time.sleep(0.5)
+            print("exiting", flush=True)
+            """
+        )
+    )
+
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    assert "exiting" in result.stdout
