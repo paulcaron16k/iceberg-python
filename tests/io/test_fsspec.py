@@ -1907,6 +1907,76 @@ def test_s3_failed_shared_connector_build_is_tried_again() -> None:
     assert len(attempts) == 2
 
 
+def test_s3_shared_pool_session_is_created_under_aiobotocores_sessions_lock() -> None:
+    """Creating a client's session holds aiobotocore's `_sessions_lock`, as aiobotocore 3.9.1's own does.
+
+    Otherwise a client could close while its session is being created and leave that session unclosed. aiobotocore
+    before 3.9.1 has no such lock, so the test gives the session one, holds it, and checks that creation waits.
+    """
+    session_class: Any = fsspec._shared_pool_session()
+    assert session_class is not None
+
+    async def scenario() -> tuple[bool, bool]:
+        async with session_class() as session:
+            session._sessions_lock = lock = asyncio.Lock()
+            async with lock:
+                creating = asyncio.create_task(session._get_session(None))
+                await asyncio.sleep(0.1)
+                waited = not creating.done()
+            await creating
+            return waited, None in session._sessions
+
+    loop = asyncio.new_event_loop()
+    try:
+        waited, created = loop.run_until_complete(scenario())
+        for connector in fsspec._built_connectors({loop: fsspec._SHARED_CONNECTORS.pop(loop, {})}):
+            loop.run_until_complete(connector.close())
+    finally:
+        loop.close()
+
+    assert waited, "the session was created while the lock was held"
+    assert created
+
+
+def test_s3_request_queued_behind_close_creates_no_session_on_the_closed_client() -> None:
+    """A request waiting on `_sessions_lock` while its client closes must not reopen it.
+
+    aiobotocore 3.9.1's `close` empties the sessions dict, closes the exit stack and sets `_sessions` to None, all under
+    the lock. Read before the lock, the emptied dict sent the waiting request on to build a session that nothing would
+    close (ZMBNI-260). The test does what that `close` does while holding a lock of its own, so it runs on any
+    aiobotocore; the queued request must fail, as in aiobotocore's own `_get_session`.
+    """
+    session_class: Any = fsspec._shared_pool_session()
+    assert session_class is not None
+
+    async def scenario() -> BaseException | None:
+        session = session_class()
+        await session.__aenter__()
+        session._sessions_lock = lock = asyncio.Lock()
+        async with lock:
+            creating = asyncio.create_task(session._get_session(None))
+            await asyncio.sleep(0.1)
+            session._sessions.clear()  # 3.9.1's `__aexit__`, under the lock.
+            await session._exit_stack.aclose()
+            session._sessions = None
+        try:
+            leaked = await creating
+        except AttributeError as exc:
+            return exc
+        await leaked.close()
+        return None
+
+    loop = asyncio.new_event_loop()
+    try:
+        refused = loop.run_until_complete(scenario())
+        for connector in fsspec._built_connectors({loop: fsspec._SHARED_CONNECTORS.pop(loop, {})}):
+            loop.run_until_complete(connector.close())
+    finally:
+        loop.close()
+
+    assert refused is not None, "a session was created on a client already closed"
+
+
 def test_s3_shares_a_pool_with_an_aiobotocore_whose_connector_is_built_synchronously(
     stand_in: tuple[str, type[_StandIn]],
 ) -> None:
