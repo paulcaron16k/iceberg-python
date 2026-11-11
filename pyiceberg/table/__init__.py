@@ -62,6 +62,7 @@ from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadata
 from pyiceberg.table.name_mapping import NameMapping
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef
 from pyiceberg.table.snapshots import (
+    IsolationLevel,
     Operation,
     Snapshot,
     SnapshotLogEntry,
@@ -92,7 +93,7 @@ from pyiceberg.table.update import (
     update_table_metadata,
 )
 from pyiceberg.table.update.schema import UpdateSchema
-from pyiceberg.table.update.snapshot import ManageSnapshots, UpdateSnapshot, _FastAppendFiles
+from pyiceberg.table.update.snapshot import ManageSnapshots, UpdateSnapshot, _FastAppendFiles, _OverwriteFiles
 from pyiceberg.table.update.sorting import UpdateSortOrder
 from pyiceberg.table.update.spec import UpdateSpec
 from pyiceberg.table.update.statistics import UpdateStatistics
@@ -243,6 +244,7 @@ class TableProperties:
 
     WRITE_DELETE_ISOLATION_LEVEL = "write.delete.isolation-level"
     WRITE_UPDATE_ISOLATION_LEVEL = "write.update.isolation-level"
+    WRITE_MERGE_ISOLATION_LEVEL = "write.merge.isolation-level"
     WRITE_ISOLATION_LEVEL_DEFAULT = "serializable"
 
 
@@ -767,8 +769,6 @@ class Transaction:
             case_sensitive: A bool determine if the provided `delete_filter` is case-sensitive
             branch: Branch Reference to run the delete operation
         """
-        from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files, _expression_to_complementary_pyarrow
-
         if (
             self.table_metadata.properties.get(TableProperties.DELETE_MODE, TableProperties.DELETE_MODE_DEFAULT)
             == TableProperties.DELETE_MODE_MERGE_ON_READ
@@ -785,52 +785,14 @@ class Transaction:
 
         # Check if there are any files that require an actual rewrite of a data file
         if delete_snapshot.rewrites_needed is True:
-            bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
-            preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
-
             file_scan = self._scan(row_filter=delete_filter, case_sensitive=case_sensitive)
             if branch is not None:
                 file_scan = file_scan.use_ref(branch)
-            files = file_scan.plan_files()
 
             commit_uuid = uuid.uuid4()
-            counter = itertools.count(0)
-
-            replaced_files: list[tuple[DataFile, list[DataFile]]] = []
-            # This will load the Parquet file into memory, including:
-            #   - Filter out the rows based on the delete filter
-            #   - Projecting it to the current schema
-            #   - Applying the positional deletes if they are there
-            # When writing
-            #   - Apply the latest partition-spec
-            #   - And sort order when added
-            for original_file in files:
-                df = ArrowScan(
-                    table_metadata=self.table_metadata,
-                    io=self._table.io,
-                    projected_schema=self.table_metadata.schema(),
-                    row_filter=AlwaysTrue(),
-                ).to_table(tasks=[original_file])
-                filtered_df = df.filter(preserve_row_filter)
-
-                # Only rewrite if there are records being deleted
-                if len(filtered_df) == 0:
-                    replaced_files.append((original_file.file, []))
-                elif len(df) != len(filtered_df):
-                    replaced_files.append(
-                        (
-                            original_file.file,
-                            list(
-                                _dataframe_to_data_files(
-                                    io=self._table.io,
-                                    df=filtered_df,
-                                    table_metadata=self.table_metadata,
-                                    write_uuid=commit_uuid,
-                                    counter=counter,
-                                )
-                            ),
-                        )
-                    )
+            replaced_files = self._rewrite_data_files(
+                file_scan.plan_files(), delete_filter, case_sensitive, commit_uuid, itertools.count(0)
+            )
 
             if len(replaced_files) > 0:
                 with self.update_snapshot(
@@ -849,6 +811,57 @@ class Transaction:
         if not delete_snapshot.files_affected and not delete_snapshot.rewrites_needed:
             warnings.warn("Delete operation did not match any records", stacklevel=2)
 
+    def _rewrite_data_files(
+        self,
+        tasks: Iterable[FileScanTask],
+        delete_filter: BooleanExpression,
+        case_sensitive: bool,
+        write_uuid: uuid.UUID,
+        counter: itertools.count[int],
+    ) -> list[tuple[DataFile, list[DataFile]]]:
+        """Rewrite the data files of the scan tasks without the rows that match the filter.
+
+        Each file is loaded into memory, with its positional deletes applied and projected to the current
+        schema, and the remaining rows are written under the latest partition spec.
+
+        Returns:
+            Each data file holding a matching row, with the data files replacing it (none when no row remains).
+        """
+        from pyiceberg.io.pyarrow import ArrowScan, _dataframe_to_data_files, _expression_to_complementary_pyarrow
+
+        bound_delete_filter = bind(self.table_metadata.schema(), delete_filter, case_sensitive)
+        preserve_row_filter = _expression_to_complementary_pyarrow(bound_delete_filter, self.table_metadata.schema())
+
+        replaced_files: list[tuple[DataFile, list[DataFile]]] = []
+        for original_file in tasks:
+            df = ArrowScan(
+                table_metadata=self.table_metadata,
+                io=self._table.io,
+                projected_schema=self.table_metadata.schema(),
+                row_filter=AlwaysTrue(),
+            ).to_table(tasks=[original_file])
+            filtered_df = df.filter(preserve_row_filter)
+
+            # Only rewrite if there are records being deleted
+            if len(filtered_df) == 0:
+                replaced_files.append((original_file.file, []))
+            elif len(df) != len(filtered_df):
+                replaced_files.append(
+                    (
+                        original_file.file,
+                        list(
+                            _dataframe_to_data_files(
+                                io=self._table.io,
+                                df=filtered_df,
+                                table_metadata=self.table_metadata,
+                                write_uuid=write_uuid,
+                                counter=counter,
+                            )
+                        ),
+                    )
+                )
+        return replaced_files
+
     def upsert(
         self,
         df: pa.Table,
@@ -860,6 +873,11 @@ class Transaction:
         snapshot_properties: dict[str, str] = EMPTY_DICT,
     ) -> UpsertResult:
         """Shorthand API for performing an upsert to an iceberg table.
+
+        The rewritten data files, the updated rows and the inserted rows are committed as one snapshot, validated
+        at the isolation level in `write.merge.isolation-level`. Under `serializable` (the default), a concurrent
+        commit that added data or delete files which could hold rows with the upserted keys makes it fail with a
+        ValidationException; under `snapshot`, only delete files are checked.
 
         Args:
             df: The input dataframe to upsert with the table's data.
@@ -900,7 +918,7 @@ class Transaction:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For writes PyArrow needs to be installed") from e
 
-        from pyiceberg.io.pyarrow import expression_to_pyarrow
+        from pyiceberg.io.pyarrow import _dataframe_to_data_files, expression_to_pyarrow
         from pyiceberg.table import upsert_util
 
         if join_cols is None:
@@ -980,20 +998,67 @@ class Transaction:
         update_row_cnt = 0
         insert_row_cnt = 0
 
+        commit_uuid = uuid.uuid4()
+        counter = itertools.count(0)
+        replaced_files: list[tuple[DataFile, list[DataFile]]] = []
+        rows_to_write: list[pa.Table] = []
+
         if batches_to_overwrite:
             rows_to_update = pa.concat_tables(batches_to_overwrite)
             update_row_cnt = len(rows_to_update)
-            self.overwrite(
-                rows_to_update,
-                overwrite_filter=Or(*overwrite_predicates) if len(overwrite_predicates) > 1 else overwrite_predicates[0],
-                branch=branch,
-                snapshot_properties=snapshot_properties,
+            overwrite_filter = Or(*overwrite_predicates) if len(overwrite_predicates) > 1 else overwrite_predicates[0]
+            # Plan from the scan the matches were read from, so the files rewritten are the files matched
+            replaced_files = self._rewrite_data_files(
+                matched_iceberg_record_batches_scan.update(row_filter=overwrite_filter).plan_files(),
+                overwrite_filter,
+                case_sensitive,
+                commit_uuid,
+                counter,
             )
+            rows_to_write.append(rows_to_update)
 
         if when_not_matched_insert_all:
             insert_row_cnt = len(rows_to_insert)
-            if rows_to_insert:
-                self.append(rows_to_insert, branch=branch, snapshot_properties=snapshot_properties)
+            if insert_row_cnt > 0:
+                rows_to_write.append(rows_to_insert)
+
+        if not replaced_files and not rows_to_write:
+            return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
+
+        # Commit the rewritten files, the updated rows and the inserted rows as one snapshot, as a copy-on-write
+        # MERGE does in Java. A separate append for the inserted rows would skip validation: two writers inserting
+        # the same new key would each commit it, the second replayed onto the first by the commit retry.
+        with _OverwriteFiles(
+            operation=Operation.OVERWRITE if replaced_files else Operation.APPEND,
+            transaction=self,
+            io=self._table.io,
+            branch=branch,
+            commit_uuid=commit_uuid,
+            snapshot_properties=snapshot_properties,
+        ) as overwrite_snapshot:
+            # Validate from the snapshot the matches were read from, with every key matched against as the
+            # conflict-detection filter, at the isolation level of a merge
+            scan_snapshot = matched_iceberg_record_batches_scan.snapshot()
+            overwrite_snapshot._starting_snapshot_id = scan_snapshot.snapshot_id if scan_snapshot is not None else None
+            overwrite_snapshot._isolation_level = IsolationLevel(
+                self.table_metadata.properties.get(
+                    TableProperties.WRITE_MERGE_ISOLATION_LEVEL, TableProperties.WRITE_ISOLATION_LEVEL_DEFAULT
+                )
+            )
+            overwrite_snapshot.delete_by_predicate(matched_predicate, case_sensitive)
+            if rows_to_write:
+                for data_file in _dataframe_to_data_files(
+                    table_metadata=self.table_metadata,
+                    df=pa.concat_tables(rows_to_write),
+                    io=self._table.io,
+                    write_uuid=commit_uuid,
+                    counter=counter,
+                ):
+                    overwrite_snapshot.append_data_file(data_file)
+            for original_data_file, replaced_data_files in replaced_files:
+                overwrite_snapshot.delete_data_file(original_data_file)
+                for replaced_data_file in replaced_data_files:
+                    overwrite_snapshot.append_data_file(replaced_data_file)
 
         return UpsertResult(rows_updated=update_row_cnt, rows_inserted=insert_row_cnt)
 

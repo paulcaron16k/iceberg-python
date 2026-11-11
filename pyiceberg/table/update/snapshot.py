@@ -59,6 +59,7 @@ from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
+    IsolationLevel,
     Operation,
     Snapshot,
     SnapshotSummaryCollector,
@@ -159,6 +160,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     _case_sensitive: bool
     _commit_window: CommitWindow | None
     _conflict_detection_filter: BooleanExpression | None
+    _isolation_level: IsolationLevel | None
     _written_manifests: list[str]
     _uncommitted_manifests: list[str]
     _written_manifest_lists: list[str]
@@ -198,6 +200,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._commit_window = None
         self._conflict_detection_filter = None
         self._isolation_operation: Operation = Operation.DELETE
+        # Set by a command whose isolation level is not keyed by its snapshot operation, such as an upsert
+        self._isolation_level = None
 
     def _validate_target_branch(self, branch: str | None) -> str | None:
         # if branch is none, write will be written into a staging snapshot
@@ -514,7 +518,6 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         Subclasses that do not require validation (e.g. fast append) should override
         with a no-op.
         """
-        from pyiceberg.table.snapshots import IsolationLevel
         from pyiceberg.table.update.validate import (
             _validate_added_data_files,
             _validate_data_files_exist,
@@ -534,7 +537,11 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
             return
 
         table = self._transaction._table
-        isolation_level = table.metadata.isolation_level(self._isolation_operation)
+        isolation_level = (
+            self._isolation_level
+            if self._isolation_level is not None
+            else table.metadata.isolation_level(self._isolation_operation)
+        )
         conflict_detection_filter = self._predicate if self._predicate != AlwaysFalse() else None
 
         if isolation_level == IsolationLevel.SERIALIZABLE and conflict_detection_filter is not None:
