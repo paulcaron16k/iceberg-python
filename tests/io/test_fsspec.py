@@ -15,12 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import asyncio
+import concurrent.futures
+import gc
+import inspect
+import json
+import logging
 import os
 import pickle
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
+import time
 import uuid
-from typing import Any
+import weakref
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, ClassVar
 from unittest import mock
 
 import pytest
@@ -1224,3 +1237,763 @@ def test_s3v4_rest_signer_uses_auth_manager(requests_mock: Mocker) -> None:
     assert requests_mock.last_request is not None
     assert requests_mock.last_request.headers["Authorization"] == "Bearer via-manager"
     assert request.url == new_uri
+
+
+SIGNER_EVENT = "before-sign.s3"
+SIGNER_UNIQUE_ID = 1925
+
+
+def _signer_properties() -> Properties:
+    return {"s3.signer": "S3V4RestSigner", "uri": TEST_URI, "token": "abc", "s3.region": "us-east-1"}
+
+
+def _signers_on(emitter: Any) -> list[Any]:
+    """The signers registered for `before-sign`, unwrapped from the handler that runs them off the event loop."""
+    return [getattr(handler, "signer", handler) for handler in emitter._emitter._handlers.prefix_search(SIGNER_EVENT)]
+
+
+def _signer_installed(emitter: Any) -> bool:
+    return any(isinstance(signer, S3V4RestSigner) for signer in _signers_on(emitter))
+
+
+def test_s3_leaves_a_signer_installed_while_reconfiguring_a_shared_client() -> None:
+    """`_s3()` must never leave the shared event emitter without a signer.
+
+    fsspec caches `S3FileSystem`, so the botocore client and its event emitter are shared by
+    every thread, and `_s3()` sets `signature_version=UNSIGNED`. A request signed while no
+    handler is installed is therefore sent with no `Authorization` header, and the store
+    answers 403.
+    """
+    fs = fsspec._s3(_signer_properties())
+    emitter = fs.s3.meta.events
+    real_unregister = emitter.unregister
+    installed: list[bool] = []
+
+    def watched_unregister(*args: Any, **kwargs: Any) -> None:
+        real_unregister(*args, **kwargs)
+        installed.append(_signer_installed(emitter))
+
+    with mock.patch.object(emitter, "unregister", watched_unregister):
+        fsspec._s3(_signer_properties())
+
+    # Asserted as well as the window, so the test still says something if a future `_s3()`
+    # stops touching this emitter at all -- otherwise it would pass on an empty observation
+    # list for reasons unrelated to the defect.
+    assert _signer_installed(emitter), "a signer must be installed once _s3() returns"
+    assert all(installed), (
+        f"_s3() left the shared signing emitter with no handler ({installed.count(False)} of {len(installed)} observations)"
+    )
+
+
+def test_the_signer_stays_installed_while_another_thread_reconfigures_s3() -> None:
+    """The same defect under concurrency, which is how production reaches it.
+
+    `FsspecFileIO.get_fs` caches per thread and every table gets its own `FileIO`, so a short
+    workload makes hundreds of `_s3()` calls against the one shared emitter, any of which can
+    open the window under a thread that is signing.
+
+    The window is two adjacent statements, so sampling for it blind is a coin flip -- 20,000
+    observations against an unmodified `_s3()` caught it zero times. It is held open here by
+    delaying the *re-registration* only: the `unregister` that opens it, the emitter, and the
+    thread that observes it are all real, and dropping the `unregister` closes the window
+    whatever the delay. Timing is made deterministic; the defect is not manufactured.
+    """
+    fs = fsspec._s3(_signer_properties())
+    emitter = fs.s3.meta.events
+    real_register_last = emitter.register_last
+
+    def slow_register_last(*args: Any, **kwargs: Any) -> None:
+        time.sleep(0.05)
+        real_register_last(*args, **kwargs)
+
+    observations: list[bool] = []
+    stop = threading.Event()
+
+    def observe() -> None:
+        while not stop.is_set():
+            observations.append(_signer_installed(emitter))
+            time.sleep(0.001)
+
+    watcher = threading.Thread(target=observe, daemon=True)
+    watcher.start()
+    try:
+        with mock.patch.object(emitter, "register_last", slow_register_last):
+            fsspec._s3(_signer_properties())
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    missing = observations.count(False)
+    assert missing == 0, (
+        f"{missing} of {len(observations)} observations from another thread found the shared "
+        "emitter with no signer installed; a request signed at that moment is sent unsigned"
+    )
+
+
+def _installed_signers(emitter: Any) -> list[S3V4RestSigner]:
+    return [signer for signer in _signers_on(emitter) if isinstance(signer, S3V4RestSigner)]
+
+
+def test_s3_signs_each_table_through_its_own_signer_endpoint() -> None:
+    """Tables with different signer endpoints must not sign through each other's (#2005).
+
+    Without replacing the handler, the signer registered first would otherwise keep signing for
+    every later table, since registering under an existing unique_id is a no-op.
+    """
+    first = fsspec._s3({**_signer_properties(), "s3.signer.endpoint": "v1/first/sign"})
+    second = fsspec._s3({**_signer_properties(), "s3.signer.endpoint": "v1/second/sign"})
+
+    assert first is not second
+    first_signers = _installed_signers(first.s3.meta.events)
+    second_signers = _installed_signers(second.s3.meta.events)
+    assert [signer.properties["s3.signer.endpoint"] for signer in first_signers] == ["v1/first/sign"]
+    assert [signer.properties["s3.signer.endpoint"] for signer in second_signers] == ["v1/second/sign"]
+
+
+def test_s3_shares_one_client_between_identical_signer_properties() -> None:
+    first = fsspec._s3(_signer_properties())
+    second = fsspec._s3(_signer_properties())
+
+    assert first is second
+    assert len(_installed_signers(first.s3.meta.events)) == 1
+
+
+def test_s3_does_not_retain_signer_secrets_in_the_cache_key() -> None:
+    fs = fsspec._s3({**_signer_properties(), "token": "not-a-hex-secret"})
+
+    assert "not-a-hex-secret" not in repr(fs.storage_options)
+
+
+def test_s3_releases_a_signed_filesystem_no_table_uses() -> None:
+    """fsspec's instance cache kept every signed filesystem until exit.
+
+    With it went the client, the signer and what the signer holds: three open sockets for every catalog
+    and table in a long-lived process. The client is closed on fsspec's loop thread after the filesystem
+    goes, so the signer is waited for rather than expected at once.
+    """
+    fs = fsspec._s3(_signer_properties())
+    filesystem = weakref.ref(fs)
+    (signer,) = [weakref.ref(s) for s in _installed_signers(fs.s3.meta.events)]
+    del fs
+
+    deadline = time.monotonic() + 5
+    while (filesystem() is not None or signer() is not None) and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.05)
+
+    assert filesystem() is None, "nothing uses the filesystem, but something still holds it"
+    assert signer() is None, "the filesystem went, but its signer stayed"
+
+
+def test_s3_keeps_the_signer_when_the_client_is_recreated() -> None:
+    """s3fs recreates its client on refresh, and when its connection pool has closed."""
+    fs = fsspec._s3(_signer_properties())
+    fs.connect(refresh=True)
+
+    assert len(_installed_signers(fs.s3.meta.events)) == 1
+
+
+class _ScriptedSigner(fsspec.S3RequestSigner):
+    """A signer that runs `script`, a callable set by each test, instead of calling a sign endpoint."""
+
+    script: Any = None
+
+    def __call__(self, request: AWSRequest, **_: Any) -> None:
+        type(self).script(self.properties["s3.signer.endpoint"])
+
+
+@pytest.fixture
+def scripted_signer() -> Any:
+    """Register `_ScriptedSigner` under a name of its own for the duration of the test."""
+    with mock.patch.dict(fsspec.SIGNERS, {"scripted": _ScriptedSigner}):
+        yield _ScriptedSigner
+    _ScriptedSigner.script = None
+
+
+def _scripted_filesystem(endpoint: str) -> AbstractFileSystem:
+    # Explicit credentials keep botocore from walking its credential chain when it creates the client; the signer
+    # replaces AWS signing, so they are never used.
+    return fsspec._s3(
+        {
+            "s3.signer": "scripted",
+            "s3.signer.endpoint": f"{endpoint}-{uuid.uuid4().hex}",
+            "uri": TEST_URI,
+            "s3.endpoint": "http://localhost.invalid",
+            "s3.region": "us-east-1",
+            "s3.access-key-id": "unused",
+            "s3.secret-access-key": "unused",
+        }
+    )
+
+
+def _presign(fs: Any) -> str:
+    """Sign a request through `fs`'s client, as botocore signs one it sends, without sending anything.
+
+    Bounded, so a request whose signing outcome is lost fails the test instead of hanging it.
+    """
+    from fsspec.asyn import sync
+
+    return sync(fs.loop, fs.s3.generate_presigned_url, "put_object", Params={"Bucket": "b", "Key": "k"}, timeout=10)
+
+
+def test_s3_signs_concurrent_requests_concurrently(scripted_signer: Any) -> None:
+    """A signer that waits must not hold up the other requests on fsspec's event loop.
+
+    Each signer waits at a barrier for the other, so the two only finish if they run at the same time. Signed inline
+    on the loop, as aiobotocore runs a synchronous handler, the first waits alone and the barrier breaks.
+    """
+    barrier = threading.Barrier(2, timeout=5)
+    scripted_signer.script = lambda _: barrier.wait()
+    first, second = _scripted_filesystem("first"), _scripted_filesystem("second")
+
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        urls = list(pool.map(_presign, [first, second]))
+
+    assert len(urls) == 2
+
+
+def test_s3_signing_error_fails_its_request(scripted_signer: Any) -> None:
+    def refuse(_: str) -> None:
+        raise SignError("refused")
+
+    scripted_signer.script = refuse
+
+    with pytest.raises(SignError, match="refused"):
+        _presign(_scripted_filesystem("refused"))
+
+
+def test_s3_pending_signs_wait_on_the_loop_not_as_threads(scripted_signer: Any) -> None:
+    """A batch of requests starts at most `_SIGN_THREADS` signing threads; the rest wait on the loop.
+
+    fsspec fans a batch out up to `RLIMIT_NOFILE // 8` requests at once, and a thread per pending sign started 500
+    threads for 500 requests.
+    """
+    from fsspec.asyn import sync
+
+    peak: list[int] = []
+
+    def count(_: str) -> None:
+        peak.append(sum(thread.name == "s3-signer" for thread in threading.enumerate()))
+        time.sleep(0.02)
+
+    scripted_signer.script = count
+    fs: Any = _scripted_filesystem("batch")
+    fs.s3  # noqa: B018 - the client, built before the batch
+
+    async def batch() -> None:
+        await asyncio.gather(
+            *(fs.s3.generate_presigned_url("put_object", Params={"Bucket": "b", "Key": f"k{i}"}) for i in range(60))
+        )
+
+    sync(fs.loop, batch, timeout=30)
+
+    assert len(peak) == 60
+    # A finished thread hands its slot on just before it exits, so one or two may briefly overlap the next; without
+    # the gate there were as many threads as requests.
+    assert max(peak) < 2 * fsspec._SIGN_THREADS, f"{max(peak)} signing threads at once"
+
+
+def test_s3_signer_interrupt_fails_only_its_request(scripted_signer: Any) -> None:
+    """An interrupt raised by a signer must not stop the event loop every filesystem shares."""
+
+    def interrupt(endpoint: str) -> None:
+        if endpoint.startswith("interrupted"):
+            raise KeyboardInterrupt
+
+    scripted_signer.script = interrupt
+
+    with pytest.raises(RuntimeError, match="KeyboardInterrupt"):
+        _presign(_scripted_filesystem("interrupted"))
+    assert _presign(_scripted_filesystem("after")).startswith("http://localhost.invalid/")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_s3_forked_child_signs_while_parent_holds_every_signing_slot(scripted_signer: Any) -> None:
+    """Slots the parent's in-flight signers hold are never released in a child, where those threads do not exist."""
+    scripted_signer.script = lambda _: None
+    slots = fsspec._SIGN_SLOTS
+    for _ in range(fsspec._SIGN_THREADS):
+        slots.acquire()
+    try:
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - runs in the child
+            code = 1
+            try:
+                worker = threading.Thread(target=lambda: _presign(_scripted_filesystem("child")), daemon=True)
+                worker.start()
+                worker.join(timeout=10)
+                code = 1 if worker.is_alive() else 0
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        for _ in range(fsspec._SIGN_THREADS):
+            slots.release()
+
+    assert os.waitstatus_to_exitcode(status) == 0, "the child could not sign: it inherited its parent's held slots"
+
+
+def test_s3_process_exits_while_a_sign_endpoint_never_answers(tmp_path: Any) -> None:
+    """A sign request with no timeout must not keep the process alive, as a joined executor thread would."""
+    script = tmp_path / "hang.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import threading, time, uuid
+            from pyiceberg.io import fsspec
+            from fsspec.asyn import sync
+
+            class Hang(fsspec.S3RequestSigner):
+                def __call__(self, request, **_):
+                    threading.Event().wait()
+
+            fsspec.SIGNERS["hang"] = Hang
+            fs = fsspec._s3({"s3.signer": "hang", "uri": "http://localhost.invalid", "s3.region": "us-east-1",
+                             "s3.endpoint": "http://localhost.invalid",
+                             "s3.access-key-id": "unused", "s3.secret-access-key": "unused"})
+            threading.Thread(target=lambda: sync(fs.loop, fs.s3.generate_presigned_url, "put_object",
+                                                 Params={"Bucket": "b", "Key": "k"}), daemon=True).start()
+            time.sleep(0.5)
+            print("exiting", flush=True)
+            """
+        )
+    )
+
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    assert "exiting" in result.stdout
+
+
+class _StandIn(BaseHTTPRequestHandler):
+    """A sign endpoint and an object store on one loopback port, recording what each client socket did."""
+
+    protocol_version = "HTTP/1.1"  # Keep-alive, so a pooled connection is reused rather than reopened.
+    sign_sockets: ClassVar[set[int]]
+    object_sockets: ClassVar[set[int]]
+    closed_sockets: ClassVar[set[int]]
+    signed_by: ClassVar[list[str]]
+
+    def finish(self) -> None:
+        type(self).closed_sockets.add(self.client_address[1])
+        super().finish()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+    def _send(self, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        """Sign: echo the URI back, as a sign endpoint that adds no headers would."""
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).sign_sockets.add(self.client_address[1])
+        type(self).signed_by.append(self.path)
+        self._send(json.dumps({"uri": body["uri"], "headers": {}}).encode())
+
+    def do_GET(self) -> None:
+        type(self).object_sockets.add(self.client_address[1])
+        self._send(b"abc")
+
+    def do_HEAD(self) -> None:
+        """s3fs asks for an object's size before it reads it."""
+        type(self).object_sockets.add(self.client_address[1])
+        self.send_response(200)
+        self.send_header("Content-Length", "3")
+        self.end_headers()
+
+
+@pytest.fixture
+def stand_in() -> Iterator[tuple[str, type[_StandIn]]]:
+    """A fresh loopback stand-in and its address, with no pooled connection left from an earlier test.
+
+    The shared pools outlive a test, and a pooled keep-alive connection to an earlier stand-in on a reused port would
+    reach that server's handler instead of this one's.
+    """
+    fsspec._close_shared_connectors()
+    fsspec._SIGNING_SESSION = None
+
+    class Handler(_StandIn):
+        sign_sockets: ClassVar[set[int]] = set()
+        object_sockets: ClassVar[set[int]] = set()
+        closed_sockets: ClassVar[set[int]] = set()
+        signed_by: ClassVar[list[str]] = []
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", Handler
+    finally:
+        fsspec._close_shared_connectors()
+        fsspec._SIGNING_SESSION = None
+        server.shutdown()
+        server.server_close()
+
+
+def _table_properties(address: str, table: int) -> Properties:
+    """What Lakekeeper 0.13.1 vends a table on a signing warehouse: the same for each, but for the sign endpoint."""
+    return {
+        **_signer_properties(),
+        "uri": address,
+        "s3.endpoint": address,
+        "s3.signer.endpoint": f"v1/signer/tabular-id/{table}-{uuid.uuid4().hex}/v1/aws/s3/sign",
+        "s3.access-key-id": "unused",
+        "s3.secret-access-key": "unused",
+    }
+
+
+def _sign_paths(handler: type[_StandIn]) -> list[str]:
+    return [path.split("/")[4].split("-")[0] for path in handler.signed_by]
+
+
+def test_s3_tables_share_connections_but_each_signs_through_its_own_endpoint(stand_in: tuple[str, type[_StandIn]]) -> None:
+    """Each table's client and signer kept their own connection pools, so each table held two sockets.
+
+    Five tables read one object each, in turn: a HEAD and a GET, each signed. Shared, the sign endpoint and the object
+    store each see one connection; per table, they saw five of each. Each table is still signed by its own endpoint.
+    """
+    address, handler = stand_in
+    tables = [fsspec._s3(_table_properties(address, i)) for i in range(5)]
+    for i, fs in enumerate(tables):
+        assert fs.cat_file(f"s3://b/k{i}") == b"abc"
+
+    assert len({id(fs) for fs in tables}) == len(tables), "each table must keep its own client and signer"
+    assert _sign_paths(handler) == [str(i) for i in range(5) for _ in range(2)]
+    assert (len(handler.sign_sockets), len(handler.object_sockets)) == (1, 1)
+
+
+def test_s3_releasing_a_table_leaves_the_shared_pool_to_the_others(stand_in: tuple[str, type[_StandIn]]) -> None:
+    """A released table's client closes its session; the shared pool must stay open for the rest."""
+    address, handler = stand_in
+    released = fsspec._s3(_table_properties(address, 0))
+    kept = fsspec._s3(_table_properties(address, 1))
+    assert released.cat_file("s3://b/first") == b"abc"
+    client_session = next(iter(released.s3._endpoint.http_session._sessions.values()))
+    gone = weakref.ref(released)
+    del released
+    gc.collect()
+    assert gone() is None
+    # Otherwise the test would pass if the release closed nothing. s3fs's finalizer schedules the close on its loop.
+    deadline = time.monotonic() + 5
+    while not client_session.closed and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert client_session.closed
+
+    assert kept.cat_file("s3://b/second") == b"abc"
+    assert len(handler.object_sockets) == 1
+
+
+def test_s3_shared_pool_size_covers_one_client_and_the_executor(stand_in: tuple[str, type[_StandIn]]) -> None:
+    from botocore.endpoint import MAX_POOL_CONNECTIONS
+
+    from pyiceberg.utils.concurrent import ExecutorFactory
+
+    address, _ = stand_in
+    fs = fsspec._s3(_table_properties(address, 0))
+    assert fs.cat_file("s3://b/k") == b"abc"
+    connector = next(iter(fs.s3._endpoint.http_session._sessions.values())).connector
+
+    assert connector.limit == MAX_POOL_CONNECTIONS + ExecutorFactory.get_or_create()._max_workers  # type: ignore[attr-defined]
+
+
+def test_s3_many_threads_across_tables_queue_for_a_small_shared_pool(stand_in: tuple[str, type[_StandIn]]) -> None:
+    """Sixteen threads over four tables share a pool of two without exceeding it, and all of them succeed.
+
+    Two rather than the real size, which per-table pools would also stay within. Queueing must not deadlock.
+    """
+    address, handler = stand_in
+    failures: list[BaseException] = []
+    with mock.patch.object(fsspec, "_shared_pool_size", lambda: 2):
+        tables = [fsspec._s3(_table_properties(address, i)) for i in range(4)]
+
+        def read(thread: int) -> None:
+            try:
+                for i in range(5):
+                    assert tables[thread % 4].cat_file(f"s3://b/{thread}-{i}") == b"abc"
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [threading.Thread(target=read, args=(n,)) for n in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+    assert not failures, failures
+    assert len(handler.signed_by) == 16 * 5 * 2
+    assert 1 <= len(handler.object_sockets) <= 2
+    assert 1 <= len(handler.sign_sockets) <= fsspec._SIGN_THREADS
+
+
+def test_s3_falls_back_to_a_pool_per_table_without_aiobotocore_internals(
+    stand_in: tuple[str, type[_StandIn]], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The shared pool relies on private aiobotocore names; with one gone, each table keeps its own pool, as before.
+
+    The guard is handed a name this aiobotocore lacks, as if a release renamed one. Deleting a real one would break
+    aiobotocore's own session too, which uses every one of them.
+    """
+    address, handler = stand_in
+    fsspec._shared_pool_session.cache_clear()
+    try:
+        with mock.patch.object(fsspec, "_AIOHTTP_SESSION_METHODS", (*fsspec._AIOHTTP_SESSION_METHODS, "_renamed")):
+            with caplog.at_level(logging.WARNING, logger=fsspec.__name__):
+                tables = [fsspec._s3(_table_properties(address, i)) for i in range(3)]
+        for i, fs in enumerate(tables):
+            assert fs.cat_file(f"s3://b/fallback{i}") == b"abc"
+    finally:
+        fsspec._shared_pool_session.cache_clear()
+
+    assert "_renamed" in caplog.text
+    assert len(handler.object_sockets) == len(tables)
+
+
+def test_s3_shared_pool_is_closed_at_exit() -> None:
+    """No client owns the shared connector, so nothing closed it and aiohttp reported it at exit."""
+    script = textwrap.dedent(
+        """
+        import json, threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from pyiceberg.io import fsspec
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, *a): pass
+            def _send(self, body):
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self._send(json.dumps({"uri": body["uri"], "headers": {}}).encode())
+            def do_GET(self):
+                self._send(b"abc")
+            def do_HEAD(self):
+                self.send_response(200); self.send_header("Content-Length", "3"); self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        address = f"http://127.0.0.1:{server.server_port}"
+        fs = fsspec._s3({"s3.signer": "S3V4RestSigner", "uri": address, "token": "abc", "s3.region": "us-east-1",
+                         "s3.endpoint": address, "s3.access-key-id": "unused", "s3.secret-access-key": "unused"})
+        assert fs.cat_file("s3://b/k") == b"abc"
+        print("read")
+        """
+    )
+
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+
+    assert "read" in result.stdout, result.stderr
+    assert "Unclosed connector" not in result.stderr, result.stderr
+
+
+@pytest.mark.filterwarnings("ignore::ResourceWarning")  # The abandoned sockets, collected later.
+def test_s3_forked_child_abandons_the_parents_connections_without_closing_them(
+    stand_in: tuple[str, type[_StandIn]],
+) -> None:
+    """Closed in a forked child, the parent's pooled sockets left the epoll set the two share.
+
+    On Linux the parent's next request on such a connection then waited for its read timeout. The fork handler runs
+    here in-process, as the child runs it, after every table has been released, so only the shared pools reference the
+    connector. Collecting it (aiohttp's `__del__`, called directly, because in this process the loop's keep-alive timer
+    still holds the connector) must leave its idle connection open, as the stand-in sees it.
+    """
+    address, handler = stand_in
+    fs = fsspec._s3(_table_properties(address, 0))
+    assert fs.cat_file("s3://b/k") == b"abc"
+    del fs
+    gc.collect()
+    assert len(handler.object_sockets) == 1
+    inherited = fsspec._built_connectors(fsspec._SHARED_CONNECTORS)
+    assert inherited
+
+    # The pooled connections' transports, read before anything can close them.
+    transports = [proto.transport for c in inherited for conns in c._conns.values() for proto, _ in conns]
+    assert transports
+
+    fsspec._reset_signing_after_fork()
+    for connector in inherited:
+        connector.__del__()
+
+    # Checked on the client, synchronously: the stand-in sees a close only once its thread reads the EOF.
+    assert not any(transport.is_closing() for transport in transports)
+    for connector in inherited:  # Abandoned on purpose; this process closes them after all.
+        connector._closed = False
+        connector._close()
+
+
+def test_s3_cancelled_request_does_not_cancel_the_shared_connector_others_await() -> None:
+    """The first request builds the shared connector and others wait for it; cancelling the first is not theirs.
+
+    Cancelled while the connector builds, as a timeout would cancel it, the first request must leave the build to
+    finish for the second, which was never cancelled.
+    """
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    real_create = AIOHTTPSession._create_connector
+    builds: list[int] = []
+
+    async def slow_create(self: AIOHTTPSession, proxy_url: str | None) -> Any:
+        builds.append(1)
+        await asyncio.sleep(0.2)
+        connector = real_create(self, proxy_url)  # A coroutine from aiobotocore 3.8 only.
+        return await connector if inspect.isawaitable(connector) else connector
+
+    session_class: Any = fsspec._shared_pool_session()
+    assert session_class is not None
+
+    async def scenario() -> tuple[bool, Any]:
+        async with session_class() as first, session_class() as second:
+            requester = asyncio.create_task(fsspec._shared_connector(first, None))
+            await asyncio.sleep(0.05)
+            waiter = asyncio.create_task(fsspec._shared_connector(second, None))
+            await asyncio.sleep(0.05)
+            requester.cancel()
+            connector = await waiter
+            await connector.close()
+            return requester.cancelled(), connector
+
+    loop = asyncio.new_event_loop()
+    try:
+        with mock.patch.object(AIOHTTPSession, "_create_connector", slow_create):
+            requester_cancelled, connector = loop.run_until_complete(scenario())
+    finally:
+        fsspec._SHARED_CONNECTORS.pop(loop, None)
+        loop.close()
+
+    assert requester_cancelled
+    assert connector is not None
+    assert len(builds) == 1, "the waiter must share the one build, not start another"
+
+
+def test_s3_failed_shared_connector_build_is_tried_again() -> None:
+    """A build that failed, say on a bad CA bundle, fails the requests waiting for it and is not kept for later ones."""
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    real_create = AIOHTTPSession._create_connector
+    attempts: list[int] = []
+
+    async def fail_once(self: AIOHTTPSession, proxy_url: str | None) -> Any:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("no CA bundle")
+        connector = real_create(self, proxy_url)  # A coroutine from aiobotocore 3.8 only.
+        return await connector if inspect.isawaitable(connector) else connector
+
+    session_class: Any = fsspec._shared_pool_session()
+    assert session_class is not None
+
+    async def scenario() -> Any:
+        async with session_class() as session:
+            with pytest.raises(OSError, match="no CA bundle"):
+                await fsspec._shared_connector(session, None)
+            connector = await fsspec._shared_connector(session, None)
+            await connector.close()
+            return connector
+
+    loop = asyncio.new_event_loop()
+    try:
+        with mock.patch.object(AIOHTTPSession, "_create_connector", fail_once):
+            connector = loop.run_until_complete(scenario())
+    finally:
+        fsspec._SHARED_CONNECTORS.pop(loop, None)
+        loop.close()
+
+    assert connector is not None
+    assert len(attempts) == 2
+
+
+def test_s3_shared_pool_session_is_created_under_aiobotocores_sessions_lock() -> None:
+    """Creating a client's session holds aiobotocore's `_sessions_lock`, as aiobotocore 3.9.1's own does.
+
+    Otherwise a client could close while its session is being created and leave that session unclosed. aiobotocore
+    before 3.9.1 has no such lock, so the test gives the session one, holds it, and checks that creation waits.
+    """
+    session_class: Any = fsspec._shared_pool_session()
+    assert session_class is not None
+
+    async def scenario() -> tuple[bool, bool]:
+        async with session_class() as session:
+            session._sessions_lock = lock = asyncio.Lock()
+            async with lock:
+                creating = asyncio.create_task(session._get_session(None))
+                await asyncio.sleep(0.1)
+                waited = not creating.done()
+            await creating
+            return waited, None in session._sessions
+
+    loop = asyncio.new_event_loop()
+    try:
+        waited, created = loop.run_until_complete(scenario())
+        for connector in fsspec._built_connectors({loop: fsspec._SHARED_CONNECTORS.pop(loop, {})}):
+            loop.run_until_complete(connector.close())
+    finally:
+        loop.close()
+
+    assert waited, "the session was created while the lock was held"
+    assert created
+
+
+def test_s3_request_queued_behind_close_creates_no_session_on_the_closed_client() -> None:
+    """A request waiting on `_sessions_lock` while its client closes must not reopen it.
+
+    aiobotocore 3.9.1's `close` empties the sessions dict, closes the exit stack and sets `_sessions` to None, all under
+    the lock. Read before the lock, the emptied dict sent the waiting request on to build a session that nothing would
+    close (ZMBNI-260). The test does what that `close` does while holding a lock of its own, so it runs on any
+    aiobotocore; the queued request must fail, as in aiobotocore's own `_get_session`.
+    """
+    session_class: Any = fsspec._shared_pool_session()
+    assert session_class is not None
+
+    async def scenario() -> BaseException | None:
+        session = session_class()
+        await session.__aenter__()
+        session._sessions_lock = lock = asyncio.Lock()
+        async with lock:
+            creating = asyncio.create_task(session._get_session(None))
+            await asyncio.sleep(0.1)
+            session._sessions.clear()  # 3.9.1's `__aexit__`, under the lock.
+            await session._exit_stack.aclose()
+            session._sessions = None
+        try:
+            leaked = await creating
+        except AttributeError as exc:
+            return exc
+        await leaked.close()
+        return None
+
+    loop = asyncio.new_event_loop()
+    try:
+        refused = loop.run_until_complete(scenario())
+        for connector in fsspec._built_connectors({loop: fsspec._SHARED_CONNECTORS.pop(loop, {})}):
+            loop.run_until_complete(connector.close())
+    finally:
+        loop.close()
+
+    assert refused is not None, "a session was created on a client already closed"
+
+
+def test_s3_shares_a_pool_with_an_aiobotocore_whose_connector_is_built_synchronously(
+    stand_in: tuple[str, type[_StandIn]],
+) -> None:
+    """`_create_connector` became a coroutine in aiobotocore 3.8; from 2.19 to 3.7 it is a plain method.
+
+    Awaited unconditionally, it failed every signed request on those versions, with every name the guard checks present.
+    """
+    import aiohttp
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    def create_synchronously(self: AIOHTTPSession, proxy_url: str | None) -> aiohttp.TCPConnector:
+        return aiohttp.TCPConnector(limit=self._max_pool_connections)
+
+    address, handler = stand_in
+    with mock.patch.object(AIOHTTPSession, "_create_connector", create_synchronously):
+        tables = [fsspec._s3(_table_properties(address, i)) for i in range(2)]
+        for i, fs in enumerate(tables):
+            assert fs.cat_file(f"s3://b/sync{i}") == b"abc"
+
+    assert len(handler.object_sockets) == 1

@@ -17,11 +17,18 @@
 """FileIO implementation for reading and writing table files that uses fsspec compatible filesystems."""
 
 import abc
+import asyncio
+import atexit
+import contextlib
 import errno
+import functools
+import hashlib
+import inspect
 import json
 import logging
 import os
 import threading
+import weakref
 from collections.abc import Callable
 from copy import copy
 from functools import lru_cache
@@ -168,6 +175,330 @@ class S3V4RestSigner(S3RequestSigner):
 SIGNERS: dict[str, type[S3RequestSigner]] = {"S3V4RestSigner": S3V4RestSigner}
 
 
+def _signer_cache_key(properties: Properties) -> str:
+    """Return a digest identifying the signer built from these properties, without retaining the secrets in them."""
+    items = sorted((key, repr(value)) for key, value in properties.items())
+    return hashlib.sha256(repr(items).encode()).hexdigest()
+
+
+#: The signed filesystems some FileIO still holds, one per signer: tables signed through different endpoints get
+#: separate clients, and identical ones share one. Weak, so a filesystem goes, with its client, its signer and
+#: what the signer holds (an auth manager and its HTTP session), when the last table using it does. fsspec's
+#: instance cache kept them all until exit, three open sockets for every catalog and table.
+_SIGNED_FILESYSTEMS: weakref.WeakValueDictionary[tuple[int, str], AbstractFileSystem] = weakref.WeakValueDictionary()
+_SIGNED_FILESYSTEMS_LOCK = threading.Lock()
+
+#: How many signing calls may run at once, process-wide. `S3V4RestSigner` posts with no timeout, so a sign endpoint
+#: that never answers holds a slot for good; ten of them stall all signing, as one stalled the event loop before
+#: signing moved off it. Ten is also `requests`' default pool size, so no signer's session opens a connection only to
+#: discard it.
+_SIGN_THREADS = 10
+#: Taken by each signing thread. Replaced in a forked child, where the parent's in-flight calls never release theirs.
+_SIGN_SLOTS = threading.BoundedSemaphore(_SIGN_THREADS)
+#: Taken on the loop before a signing thread is started, and given back when it finishes, so a batch of requests waits
+#: on the loop rather than as one blocked thread each: fsspec fans a batch out up to `RLIMIT_NOFILE // 8` requests at
+#: once, and 500 pending signs started 500 threads (found by review).
+_SIGN_GATES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+#: The one `requests.Session` every `S3V4RestSigner` of a signed filesystem posts through, keeping as many connections
+#: per host as can sign at once. Each signer kept its own before, so each table held a connection to the sign endpoint.
+#: Created on first use under `_SIGNED_FILESYSTEMS_LOCK`.
+_SIGNING_SESSION: requests.Session | None = None
+
+#: The object-store connectors every signed filesystem's clients share, per event loop and per connection settings.
+#: Each entry is the task building the connector. Read and written only on the loop it belongs to, so unlocked.
+_SHARED_CONNECTORS: dict[asyncio.AbstractEventLoop, dict[tuple[Any, ...], "asyncio.Task[Any]"]] = {}
+
+
+def _reset_signing_after_fork() -> None:
+    """Give a forked child its own signing slots, signing session and object-store connectors.
+
+    The parent's connectors are abandoned, never closed. Collected in the child, aiohttp's `BaseConnector.__del__`
+    closes their sockets, and on Linux that unregisters each from the epoll instance the child shares with the parent,
+    whose next request on that connection then waits for its read timeout. Marked closed, they are collected with
+    nothing to do.
+    """
+    global _SIGN_SLOTS, _SIGNING_SESSION
+    _SIGN_SLOTS = threading.BoundedSemaphore(_SIGN_THREADS)
+    _SIGN_GATES.clear()
+    _SIGNING_SESSION = None
+    for connector in _built_connectors(_SHARED_CONNECTORS):
+        connector._closed = True
+    _SHARED_CONNECTORS.clear()
+
+
+def _built_connectors(connectors: dict[asyncio.AbstractEventLoop, dict[tuple[Any, ...], "asyncio.Task[Any]"]]) -> list[Any]:
+    return [
+        build.result()
+        for builds in connectors.values()
+        for build in builds.values()
+        if build.done() and not build.cancelled() and build.exception() is None
+    ]
+
+
+@atexit.register
+def _close_shared_connectors() -> None:
+    """Close the shared connectors, which no client owns and so none closes; aiohttp warns about one left open.
+
+    While their loop still runs (fsspec's loop thread is a daemon, alive while atexit handlers run) they are collected
+    and closed on it, since only that thread touches its entries, and waited for briefly, so a stuck loop cannot hold
+    the exit up.
+    """
+    for loop, builds in list(_SHARED_CONNECTORS.items()):
+        if loop.is_running():
+
+            async def close_all(loop: asyncio.AbstractEventLoop = loop, builds: dict[Any, Any] = builds) -> None:
+                connectors = _built_connectors({loop: builds})
+                builds.clear()
+                for connector in connectors:
+                    with contextlib.suppress(Exception):
+                        await connector.close()
+
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(close_all(), loop).result(timeout=1)
+            continue
+        connectors = _built_connectors({loop: builds})
+        builds.clear()
+        if not loop.is_closed():
+            # `close` is a coroutine and there is no loop to run it on; `_close` does the work synchronously, as
+            # s3fs's own `close_session` falls back to.
+            for connector in connectors:
+                with contextlib.suppress(Exception):
+                    connector._close()
+
+
+def _signing_session() -> requests.Session:
+    """Return the session every signer posts through. Call under `_SIGNED_FILESYSTEMS_LOCK`.
+
+    A signer adds its own `Authorization` header to each request, so the session holds no credential of its own. It
+    keeps cookies a sign endpoint sets, as each signer's own session did, and replays them only to the domain that set
+    them.
+    """
+    global _SIGNING_SESSION
+    if _SIGNING_SESSION is None:
+        from requests.adapters import HTTPAdapter
+
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_maxsize=_SIGN_THREADS)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _SIGNING_SESSION = session
+    return _SIGNING_SESSION
+
+
+def _shared_pool_size() -> int:
+    """How many object-store connections the shared pool keeps.
+
+    As many as one client kept before (botocore's `MAX_POOL_CONNECTIONS`, which `_s3` never overrides), for the
+    caller's own threads, plus one per worker of PyIceberg's executor, which reads manifests and writes data files in
+    parallel. A request beyond the limit waits for a connection rather than failing.
+    """
+    from botocore.endpoint import MAX_POOL_CONNECTIONS
+
+    from pyiceberg.utils.concurrent import ExecutorFactory
+
+    # Typed as an `Executor`, built as a `ThreadPoolExecutor`.
+    return MAX_POOL_CONNECTIONS + getattr(ExecutorFactory.get_or_create(), "_max_workers", 0)
+
+
+#: What `_shared_pool_session`'s subclass overrides in, or reads from, aiobotocore's `AIOHTTPSession`. Private, and
+#: aiobotocore floats with s3fs, so they are checked before the subclass is used.
+_AIOHTTP_SESSION_METHODS = ("_get_session", "_create_connector")
+_AIOHTTP_SESSION_ATTRIBUTES = (
+    "_sessions",
+    "_proxy_config",
+    "_exit_stack",
+    "_timeout",
+    "_verify",
+    "_cert_file",
+    "_key_file",
+    "_connector_args",
+    "_max_pool_connections",
+)
+
+
+def _missing_internals() -> list[str]:
+    """Return the aiobotocore names the shared pool needs that the installed version lacks."""
+    from aiobotocore.config import AioConfig
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    missing = [] if "http_session_cls" in inspect.signature(AioConfig.__init__).parameters else ["AioConfig(http_session_cls)"]
+    missing += [name for name in _AIOHTTP_SESSION_METHODS if not hasattr(AIOHTTPSession, name)]
+    probe = AIOHTTPSession()
+    return missing + [name for name in _AIOHTTP_SESSION_ATTRIBUTES if not hasattr(probe, name)]
+
+
+@functools.lru_cache
+def _shared_pool_session() -> type | None:
+    """Return an aiobotocore HTTP session class whose clients share one connection pool, or None if it cannot be built.
+
+    A signing catalog vends each table its own sign endpoint, so each table has its own signer and its own client, and
+    aiobotocore builds a connector per client (`AIOHTTPSession._get_session`): a connection pool per table, all to the
+    same object store. This keeps each client's own `aiohttp.ClientSession`, which holds no sockets, but hands it a
+    shared connector it does not own, so closing a client, as releasing its filesystem does, leaves the pool open for
+    the others. Connectors are shared per event loop and per connection settings, so a client never borrows a
+    connection made under different TLS, client-certificate, proxy or connector settings.
+
+    None, with a warning, when the installed aiobotocore lacks a name the subclass relies on: each client then keeps
+    its own pool, which costs sockets, where a subclass built on a renamed internal could fail every request.
+    """
+    import aiohttp
+    from aiobotocore.httpsession import AIOHTTPSession
+
+    if missing := _missing_internals():
+        logger.warning("aiobotocore lacks %s, so each signed S3 filesystem keeps its own connection pool", ", ".join(missing))
+        return None
+
+    class SharedPoolAIOHTTPSession(AIOHTTPSession):
+        async def _get_session(self, proxy_url: str | None) -> aiohttp.ClientSession:
+            # Set by `__aenter__` and None once closed, as aiobotocore's own `_get_session` assumes.
+            sessions: dict[str | None, aiohttp.ClientSession] = self._sessions
+            if session := sessions.get(proxy_url):
+                return session
+            # Held across creation where aiobotocore has it (3.9.1 on), as its own `_get_session` holds it, so closing
+            # the client waits for a session being created instead of leaving it unclosed.
+            lock: contextlib.AbstractAsyncContextManager[Any] = getattr(self, "_sessions_lock", None) or contextlib.nullcontext()
+            async with lock:
+                # Read again under the lock: a `close` that held it emptied the old dict and set `_sessions` to None,
+                # so a request queued behind it built a session on the closed client that nothing would ever close.
+                # As in aiobotocore's own `_get_session`, such a request now fails instead.
+                sessions = self._sessions
+                if not (session := sessions.get(proxy_url)):
+                    session = await self._exit_stack.enter_async_context(
+                        aiohttp.ClientSession(
+                            connector=await _shared_connector(self, proxy_url),
+                            connector_owner=False,
+                            timeout=self._timeout,
+                            skip_auto_headers={"CONTENT-TYPE"},
+                            auto_decompress=False,
+                        )
+                    )
+                    sessions[proxy_url] = session
+            return session
+
+    return SharedPoolAIOHTTPSession
+
+
+async def _shared_connector(session: Any, proxy_url: str | None) -> Any:
+    """Return the connector shared under this session's settings on the running loop, building it once.
+
+    The build is a task of its own, which concurrent first requests all await: shielded, so a cancelled request never
+    cancels it for the others, and forgotten if it fails, so a later request tries again.
+    """
+    loop = asyncio.get_running_loop()
+    builds = _SHARED_CONNECTORS.setdefault(loop, {})
+    key = (
+        session._verify,
+        session._cert_file,
+        session._key_file,
+        proxy_url,
+        repr(sorted(session._proxy_config.settings.items())),
+        repr(sorted((session._connector_args or {}).items())),
+    )
+    if (build := builds.get(key)) is None:
+        # The shared pool's limit replaces the client's own `max_pool_connections`.
+        session._max_pool_connections = _shared_pool_size()
+        build = builds[key] = loop.create_task(_build_connector(session, proxy_url))
+        build.add_done_callback(functools.partial(_forget_failed_build, builds, key))
+    return await asyncio.shield(build)
+
+
+async def _build_connector(session: Any, proxy_url: str | None) -> Any:
+    # A coroutine from aiobotocore 3.8, which builds TLS contexts on a thread; a plain method before, back to 2.19,
+    # where awaiting it unconditionally failed every signed request (found by review).
+    connector = session._create_connector(proxy_url)
+    return await connector if inspect.isawaitable(connector) else connector
+
+
+def _forget_failed_build(
+    builds: dict[tuple[Any, ...], "asyncio.Task[Any]"], key: tuple[Any, ...], build: "asyncio.Task[Any]"
+) -> None:
+    # `exception()` also marks a failure as retrieved: every waiter is handed it.
+    if (build.cancelled() or build.exception() is not None) and builds.get(key) is build:
+        del builds[key]
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_signing_after_fork)
+
+
+class _SignOffTheLoop:
+    """A `before-sign` handler that runs a synchronous signer on a thread of its own.
+
+    aiobotocore runs a synchronous handler inline on the event loop and awaits only an awaitable result
+    (`AioHierarchicalEmitter._emit`). s3fs drives every filesystem from fsspec's one loop thread, so a signer that
+    waits on the network, as `S3V4RestSigner` does, stalled all object-store I/O in the process for each signature.
+    This returns a coroutine instead, so the loop serves other requests while the signer waits. An exception the
+    signer raises is re-raised to the request, which is then not sent.
+
+    A daemon thread per call rather than a `ThreadPoolExecutor`: an executor's workers are joined at exit
+    (`concurrent.futures.thread._python_exit`), so a sign endpoint that never answered would keep a process from
+    exiting. fsspec's loop thread, where signing ran before, is a daemon too.
+    """
+
+    def __init__(self, signer: Callable[..., None]) -> None:
+        self.signer = signer
+
+    async def __call__(self, **kwargs: Any) -> None:
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[None] = loop.create_future()
+        slots = _SIGN_SLOTS
+        if (gate := _SIGN_GATES.get(loop)) is None:
+            gate = _SIGN_GATES[loop] = asyncio.Semaphore(_SIGN_THREADS)
+        await gate.acquire()
+
+        def sign() -> None:
+            outcome: BaseException | None = None
+            try:
+                with slots:
+                    self.signer(**kwargs)
+            except Exception as exc:
+                outcome = exc
+            except BaseException as exc:
+                # Re-raised on fsspec's loop, an interrupt would stop the loop every filesystem shares; dropped, the
+                # request would wait forever. So it fails just this request.
+                outcome = RuntimeError(f"S3 request signer raised {exc!r}")
+                outcome.__cause__ = exc
+            if isinstance(outcome, StopIteration):  # A future refuses one as its exception.
+                outcome = RuntimeError(f"S3 request signer raised {outcome!r}")
+            with contextlib.suppress(RuntimeError):  # The loop has closed, so nobody is waiting.
+                loop.call_soon_threadsafe(_settle_signing, done, outcome, gate)
+
+        try:
+            threading.Thread(target=sign, name="s3-signer", daemon=True).start()
+        except BaseException:
+            gate.release()
+            raise
+        await done
+
+
+def _settle_signing(done: "asyncio.Future[None]", outcome: BaseException | None, gate: asyncio.Semaphore) -> None:
+    gate.release()  # Here rather than when the request ends: a cancelled request's signer is still running.
+    if done.done():  # The request was cancelled while its signer ran.
+        return
+    if outcome is None:
+        done.set_result(None)
+    else:
+        done.set_exception(outcome)
+
+
+@lru_cache
+def _signed_s3_filesystem() -> type[AbstractFileSystem]:
+    from s3fs import S3FileSystem
+
+    class SignedS3FileSystem(S3FileSystem):
+        """An S3FileSystem whose clients are created from a session carrying a request signer.
+
+        Kept out of fsspec's instance cache, which holds every filesystem for the life of the process;
+        `_SIGNED_FILESYSTEMS` shares them instead.
+        """
+
+        cachable = False  # codespell:ignore cachable
+
+    return SignedS3FileSystem
+
+
 def _file(_: Properties) -> LocalFileSystem:
     return LocalFileSystem(auto_mkdir=True)
 
@@ -184,13 +515,13 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     }
     config_kwargs = {}
     s3_additional_kwargs = {}
-    register_events: dict[str, Callable[[AWSRequest], None]] = {}
+    register_events: dict[str, Callable[..., Any]] = {}
 
     if signer := properties.get(S3_SIGNER):
         logger.info("Loading signer %s", signer)
         if signer_cls := SIGNERS.get(signer):
             signer = signer_cls(properties)
-            register_events["before-sign.s3"] = signer
+            register_events["before-sign.s3"] = _SignOffTheLoop(signer)
 
             # Disable the AWS Signer
             from botocore import UNSIGNED
@@ -234,13 +565,32 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     if s3_additional_kwargs:
         s3_fs_kwargs["s3_additional_kwargs"] = s3_additional_kwargs
 
-    fs = S3FileSystem(**s3_fs_kwargs)
+    if not register_events:
+        return S3FileSystem(**s3_fs_kwargs)
 
-    for event_name, event_function in register_events.items():
-        fs.s3.meta.events.unregister(event_name, unique_id=1925)
-        fs.s3.meta.events.register_last(event_name, event_function, unique_id=1925)
+    # The signer goes on the session rather than on a client: s3fs creates every client, including
+    # the ones it recreates on refresh, from the session it is given, so none is ever without the
+    # signer. Replacing the signer on a shared client instead leaves a window in which requests from
+    # other threads go out unsigned.
+    from aiobotocore.session import AioSession
 
-    return fs
+    # The pid, as fsspec keys its own cache: a forked child must not reuse a client bound to its parent's
+    # event-loop thread. The digest covers an auth manager by its repr, which carries its address; that
+    # cannot be reused while the filesystem lives, because the filesystem's signer holds it.
+    key = (os.getpid(), _signer_cache_key(properties))
+    with _SIGNED_FILESYSTEMS_LOCK:
+        if (fs := _SIGNED_FILESYSTEMS.get(key)) is not None:
+            return fs
+        if (shared_pool := _shared_pool_session()) is not None:
+            s3_fs_kwargs["config_kwargs"] = {**config_kwargs, "http_session_cls": shared_pool}
+        if isinstance(signer, S3V4RestSigner):
+            signer._session = _signing_session()
+        session = AioSession()
+        for event_name, event_function in register_events.items():
+            session.get_component("event_emitter").register_last(event_name, event_function, unique_id=1925)
+        fs = _signed_s3_filesystem()(**s3_fs_kwargs, session=session)
+        _SIGNED_FILESYSTEMS[key] = fs
+        return fs
 
 
 def _gs(properties: Properties) -> AbstractFileSystem:

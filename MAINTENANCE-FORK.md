@@ -10,9 +10,9 @@ Zamboni repository).
 
 | | |
 |---|---|
-| Base | `apache/iceberg-python` **`main` at `9299bdb8`**, pinned |
-| Consumers | ExperienceFlow IWS, via a pinned commit — not via this branch name |
-| Purpose | Hold what Zamboni currently reaches past the fence for |
+| Base | `apache/iceberg-python` **`main` at `042165ac`**, pinned (rebased 2026-10-27 from `9299bdb8`; the old tip is kept as tag `maintenance/base-9299bdb8`) |
+| Consumers | Zamboni's development build and ExperienceFlow IWS, via a pinned commit — not via this branch name. target-iceberg does not pin it; its mirrors are verified against it by hand. pip users of either get the mirrors instead |
+| Purpose | Hold what Zamboni and target-iceberg currently reach past the fence for |
 
 ## Why `main` and not the `pyiceberg-0.12.x` release branch
 
@@ -35,9 +35,19 @@ Both were measured on 2026-09-09 before choosing:
 
 **The base is pinned, not tracked.** "Off `main`" here means "off one commit of
 `main`, advanced deliberately". Nothing consumes this branch by name: consumers
-pin a commit SHA, so a rebase is a decision someone makes rather than something
-that happens to a deploy. That is also what makes the dependency reproducible,
-which a path dependency to a sibling checkout never was.
+pin a tag (or, before tags, a commit SHA), so a rebase is a decision someone
+makes rather than something that happens to a deploy. That is also what makes
+the dependency reproducible, which a path dependency to a sibling checkout never
+was.
+
+**Tags name the states consumers adopt.** Each state of this branch that a
+consumer pins gets an annotated tag `maintenance/YYYY-MM-DD` (with `.2`, `.3`
+for a second state the same day), pushed to this fork only. A tag is never
+moved or deleted: a rebase rewrites the branch, and the tag keeps every adopted
+state reachable, which a bare SHA does not. The tag pins only development, CI and
+tests; production installs of either consumer use the released PyIceberg and
+their mirrors. `maintenance/base-9299bdb8` predates the convention and only keeps
+Zamboni's old SHA pin reachable.
 
 ## How a patch gets here
 
@@ -49,38 +59,70 @@ enh/<short-name>          branched from the same pinned base
   - the behaviour, implemented in the library
   - its tests, which fail without it
                           -> merged into feature/maintenance
-                          -> the matching override deleted from Zamboni,
-                             in the same change that adopts it
+                          -> mirrored in Zamboni as a private-API override
+                             against the released 0.12 line
 ```
 
-**Nothing here is proposed upstream.** No pull requests, no issues, no comments
-on existing ones. The patches are written in upstream's own style and tested
-with upstream's own fixtures because that is how they stay reviewable and
-rebasable — not because they are going anywhere.
+## Why every change exists twice
+
+Each patch here has a twin in Zamboni, target-iceberg or both, wherever that
+consumer needs it, and that is deliberate, not drift.
+
+Zamboni's consumers install it with `pip install iceberg-zamboni`. pip resolves
+`pyiceberg` from PyPI and has no way to follow Zamboni to a git fork, so nothing
+on this branch reaches them. Meltano installs target-iceberg the same way, with
+pip, and its `pyiceberg` likewise comes from PyPI. For them, the fix or enhancement has to ship inside
+the consumer itself, as an override of PyIceberg's private API against the released
+0.12 line, which does not move. So there are two paths for the same change:
+
+1. **This branch**, where the change lives in the library with the library's own
+   tests and type checker. Zamboni's development build pins it by SHA (see
+   `[tool.uv.sources]` in Zamboni's `pyproject.toml`).
+2. **The consumer's override**, which is what pip users actually run.
+
+This branch is kept anyway, even though pip users never see it, because the end
+goal is to have every one of these changes in a released iceberg-python. A patch
+written in the library, in upstream's style and against upstream's fixtures, is
+the form that can get there. An override in a consumer is not. When a release
+carries the change, each consumer raises its minimum PyIceberg and drops its override,
+and the patch leaves this branch (see "Retiring a patch").
+
+**Nothing here is proposed upstream at this time. At some point in the future
+(date TBD), an effort to push our bug fixes and enhancements upstream will be
+started. This is why we maintain separate branches for each one.** The patches
+are written in upstream's own style and tested with upstream's own fixtures for
+the same reason: so they stay reviewable and rebasable until then.
 
 Keeping them separate is what lets each override move independently, and what
 would let any of them be dropped if upstream ever implements the same thing.
 
 ## What is on this branch
 
-Patches are added as their Zamboni stories are worked. The right-hand column
-is the point: each row is something Zamboni stops doing behind the library's
-back, and it is deleted from Zamboni in the change that adopts the patch.
+Patches are added as their Zamboni stories or target-iceberg issues are worked.
+The right-hand columns are the point: each row is something a consumer stops
+doing behind the library's back once a released PyIceberg carries the patch.
+Until then it stays in that consumer as the twin described above. A cell says
+*not needed* where that consumer never takes the code path, and *test helper*
+where the mirror exists only for Zamboni's tests and demo, never in production.
 
-| Patch | Zamboni story | Replaces in Zamboni |
-|---|---|---|
-| Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` |
-| A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | `ReplaceCommitter`'s table-level `expected_snapshot_id` guard in `committer.py` |
-| A manifest can be written with `content: deletes` (`write_manifest`, `ManifestWriterV2`) | ELT-1118 — see below | `_DeleteManifestWriter` in `testing.py` |
-| Positional delete files can be written, and `pos` is typed `long` as the spec requires (`write_positional_deletes`, `POSITIONAL_DELETE_SCHEMA`) | ELT-1121 — see below | the hand-written delete Parquet in `testing.py` |
-| Delete files are committed into delete manifests rather than data manifests (`_manifests`, `new_manifest_writer`) | ELT-1124 — see below | `_AppendDeleteFiles` in `testing.py` |
+| Patch | Driven by | Mirrored in Zamboni | Mirrored in target-iceberg |
+|---|---|---|---|
+| Added data files are written under their own partition spec (`_write_added_manifest`, `_summary`) | [ZMBNI-59](https://github.com/paulcaron16k/Zamboni/issues/59) | `MultiSpecReplaceFiles._manifests` and `._summary` in `evolution.py` | `_AppendDeleteFiles._manifests` and `._summary`, reading each file's own spec, which `write_position_deletes` sets after `DataFile.from_args` drops it (ELT-1270) |
+| A file rewrite no longer conflicts with an unrelated concurrent append (`_validate_concurrency`) | [ZMBNI-79](https://github.com/paulcaron16k/Zamboni/issues/79) | **Gap:** none since ZMBNI-79 removed the `expected_snapshot_id` guard (2026-09-16); on 0.12 such a rewrite is refused and retried. [ZMBNI-239](https://github.com/paulcaron16k/Zamboni/issues/239) | Not needed on 0.12. On this branch its merge-on-read commit goes through `_OverwriteFiles` and depends on this patch |
+| A manifest can be written with `content: deletes` (`write_manifest`, `ManifestWriterV2`) | ELT-1118 — see below | `_DeleteManifestWriter` in `testing.py` (test helper) | `_DeleteManifestWriter` in `_pyiceberg_mor.py` |
+| Positional delete files can be written, with `pos` typed `long` and both columns required, as the spec requires (`write_positional_deletes`, `POSITIONAL_DELETE_SCHEMA`) | ELT-1121 — see below | Hand-written delete Parquet in `testing.py` (test helper; not equivalent: no column bounds) | `write_position_deletes` in `_pyiceberg_mor.py` |
+| Delete files are committed into delete manifests rather than data manifests (`_manifests`, `new_manifest_writer`) | ELT-1124 — see below | `_AppendDeleteFiles` in `testing.py` (test helper, delete files only) | `_AppendDeleteFiles._manifests` in `_pyiceberg_mor.py` (ELT-1266) |
+| Delete files are committed with an overwrite, never an append, and are refused if a data file they name was concurrently rewritten (`_FastAppendFiles.append_data_file`, `_validate_referenced_data_files_exist`) | ELT-1267, ELT-1268 | Not needed in production. **Gap:** `testing.py` commits delete files through an append, which this patch refuses; Zamboni's pin predates it. [ZMBNI-240](https://github.com/paulcaron16k/Zamboni/issues/240) | `_AppendDeleteFiles._validate_concurrency` (ELT-1268); `_OverwriteFiles` on this branch (ELT-1267) |
+| The S3 remote signer is registered on the session, once per signer: concurrent writes no longer go out unsigned (403), and each table signs through its own endpoint. A signed filesystem is shared only while a FileIO holds it, so its client, signer and the catalog's auth session are released with the last table using it, not kept until exit (`_s3`, `_signed_s3_filesystem`, `_SIGNED_FILESYSTEMS`) | [ZMBNI-51](https://github.com/paulcaron16k/Zamboni/issues/51), ELT-1269, [ZMBNI-246](https://github.com/paulcaron16k/Zamboni/issues/246) | `signer.py`, installed into `SCHEME_TO_FS` by `CatalogSession` ([#242](https://github.com/paulcaron16k/Zamboni/pull/242); released when unused since #246) | `_pyiceberg_signer.py`, installed into `SCHEME_TO_FS` before `load_catalog` (ELT-1269); released when unused since ELT-1279 |
+| S3 requests are signed off the event loop, on a daemon thread per call, at most ten at once and started only once a per-loop slot is free, so one signature no longer stalls every request in the process; and signed filesystems draw on one shared object-store connector and one signing `requests.Session`, while each table keeps its own client and signs through its own endpoint (`_SignOffTheLoop`, `_shared_pool_session`, `_shared_connector`, `_signing_session`). The connector subclass relies on private aiobotocore names, checked first, with a fallback to a pool per table, and reads a client's sessions again under aiobotocore's `_sessions_lock`, so a request queued behind `close()` cannot reopen the client (ZMBNI-260) | [ZMBNI-250](https://github.com/paulcaron16k/Zamboni/issues/250), [ZMBNI-260](https://github.com/paulcaron16k/Zamboni/issues/260), ELT-1281, ELT-1283, ELT-1311 | `signer.py` (#250, #260); stands down only where the behavioural probe `s3_signing_overlaps` also holds | `_pyiceberg_signer.py` (ELT-1283, ELT-1281, ELT-1311); level with this branch since ELT-1311 (omantra/target-iceberg#162, merged 2026-11-03), which brought over the per-loop gate, the conditional `_create_connector` await and the ZMBNI-260 read |
+| An overwrite can refuse data files concurrently added under a conflict-detection filter, so two upserts of one key cannot both commit (`validate_no_conflicting_data_files`). Like Java's, it reads file bounds, so disjoint keys whose ranges overlap, or a filter of more than 200 keys, are refused once and re-resolved | ELT-1271 | Not needed in production, which has no merge-on-read upsert | `_AppendDeleteFiles._validate_concurrency`; `_OverwriteFiles` on this branch (ELT-1271) |
 
-Those three together are what let PyIceberg write a merge-on-read table at all: five rows, a delete
+Rows three to five together are what let PyIceberg write a merge-on-read table at all: five rows, a delete
 file naming two positions, and a scan that returns the other three.
 
 ### The delete-manifest patch broadens this branch, deliberately
 
-Every row above it moves something **Zamboni** reaches past the fence for, and is driven by a
+The rows before it each move something **Zamboni** reaches past the fence for, and are driven by a
 Zamboni story. The delete-manifest writer is the first that is not: it is driven by
 **`target-iceberg`'s merge-on-read initiative (ELT-1107)**, which cannot commit a delete file of any
 kind without it — `ManifestWriterV2.content()` returned `ManifestContent.DATA` unconditionally, so
@@ -88,8 +130,8 @@ there was nowhere to put one.
 
 It still earns its row on the original terms, because Zamboni already carries the same override:
 `_DeleteManifestWriter` in `src/zamboni/testing.py`, which exists only so the merge-on-read path can
-be exercised at all. That override is deleted when Zamboni adopts this patch, exactly as the others
-are.
+be exercised at all. Like the others, that override stays in Zamboni until a released PyIceberg
+carries this patch.
 
 What changes is the branch's stated purpose: it now carries patches **two** consumers need, not one.
 Worth knowing before the next patch is proposed, because "does Zamboni need it?" is no longer the
@@ -107,16 +149,18 @@ humans.
 
 ## Retiring a patch
 
-A patch leaves this branch when upstream ships the same behaviour, which is not
-something anyone here is arranging. If that happens:
+A patch leaves this branch when a released upstream ships the same behaviour,
+which is the goal for every row. When that happens:
 
 1. Confirm by measurement that the released library does what the patch did.
 2. Drop the patch from this branch and rebase onto the release.
-3. Delete its row from the table above.
+3. In each consumer that mirrors it, raise the minimum PyIceberg to that
+   release and delete the matching override, so pip users get the behaviour from the library.
+4. Delete its row from the table above.
 
-When the table is empty, delete the branch and pin the consumer back to a
-released PyIceberg. Until then this branch is the dependency, and every row in
-the table is something Zamboni no longer has to do behind the library's back.
+Merged to upstream `main` is not enough. pip users only get what is released,
+so the consumers' overrides stay until a release carries the change. When the table
+is empty, delete the branch and pin Zamboni back to a released PyIceberg.
 
 ## Verifying a change against Zamboni
 
