@@ -133,6 +133,7 @@ These properties control conflict detection behavior during concurrent writes.
 | -------------------------------- | -------------------------------- | ------------ | ----------------------------------------------------------------------------------------------- |
 | `write.delete.isolation-level`   | `{serializable,snapshot}`        | serializable | Isolation level for delete operations. Under `serializable`, concurrent appends to affected partitions cause `ValidationException`. Under `snapshot`, only conflicting deletes are rejected. |
 | `write.update.isolation-level`   | `{serializable,snapshot}`        | serializable | Isolation level for overwrite operations. Same semantics as `write.delete.isolation-level`.      |
+| `write.merge.isolation-level`    | `{serializable,snapshot}`        | serializable | Isolation level for upsert operations. Under `serializable`, data or delete files concurrently added that could hold the upserted keys cause `ValidationException`. Under `snapshot`, only conflicting deletes are rejected. |
 
 ## FileIO
 

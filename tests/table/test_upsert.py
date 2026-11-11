@@ -23,17 +23,17 @@ from datafusion import SessionContext
 from pyarrow import Table as pa_table
 
 from pyiceberg.catalog import Catalog
-from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.exceptions import NoSuchTableError, ValidationException
 from pyiceberg.expressions import AlwaysTrue, And, EqualTo, Reference
 from pyiceberg.expressions.literals import LongLiteral
-from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.io.pyarrow import _dataframe_to_data_files, schema_to_pyarrow, write_positional_deletes
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table import Table, UpsertResult
+from pyiceberg.table import Table, TableProperties, UpsertResult
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.upsert_util import create_match_filter
 from pyiceberg.transforms import DayTransform
-from pyiceberg.types import IntegerType, NestedField, StringType, StructType, TimestampType
+from pyiceberg.types import IntegerType, LongType, NestedField, StringType, StructType, TimestampType
 from tests.catalog.test_base import InMemoryCatalog
 
 
@@ -375,7 +375,8 @@ def test_upsert_with_identifier_fields(catalog: Catalog) -> None:
     )
     upd = tbl.upsert(df)
 
-    expected_operations = [Operation.APPEND, Operation.OVERWRITE, Operation.APPEND, Operation.APPEND]
+    # One snapshot: the rewritten file, the updated row and the inserted row are committed together
+    expected_operations = [Operation.APPEND, Operation.OVERWRITE]
 
     assert upd.rows_updated == 1
     assert upd.rows_inserted == 1
@@ -920,10 +921,181 @@ def test_upsert_snapshot_properties(catalog: Catalog) -> None:
 
     # Verify properties are on the snapshots created by upsert
     snapshots = list(tbl.snapshots())
-    # Upsert should have created additional snapshots (overwrite + append)
-    assert len(snapshots) > initial_snapshot_count
+    # Upsert should have created one additional snapshot
+    assert len(snapshots) == initial_snapshot_count + 1
 
     # Check that all new snapshots have the snapshot_properties
     for snapshot in snapshots[initial_snapshot_count:]:
         assert snapshot.summary is not None
         assert snapshot.summary.additional_properties.get("test_prop") == "test_value"
+
+
+_KEYED_SCHEMA = Schema(
+    NestedField(1, "id", LongType(), required=True),
+    NestedField(2, "name", StringType(), required=True),
+    identifier_field_ids=[1],
+)
+
+
+def _keyed_rows(*rows: tuple[int, str]) -> pa_table:
+    return pa.Table.from_pylist([{"id": key, "name": name} for key, name in rows], schema=schema_to_pyarrow(_KEYED_SCHEMA))
+
+
+def _keyed_table(catalog: Catalog, identifier: str, properties: dict[str, str] | None = None) -> Table:
+    """Three rows in one data file, so the row with key 2 is at position 1."""
+    _drop_table(catalog, identifier)
+    table = catalog.create_table(identifier, schema=_KEYED_SCHEMA, properties={"format-version": "2", **(properties or {})})
+    table.append(_keyed_rows((1, "a"), (2, "b"), (3, "c")))
+    return table
+
+
+def _rows(catalog: Catalog, identifier: str) -> list[tuple[int, str]]:
+    return sorted((row["id"], row["name"]) for row in catalog.load_table(identifier).scan().to_arrow().to_pylist())
+
+
+def _merge_on_read_upsert(table: Table, key: int, name: str, position: int | None) -> None:
+    """Upsert one row as a merge-on-read writer does: delete the old row by position, if any, and add the new one."""
+    tx = table.transaction()
+    update = tx.update_snapshot().overwrite()
+    update.validate_no_conflicting_data_files(EqualTo("id", key))
+    if position is not None:
+        data_file = next(iter(table.scan().plan_files())).file
+        update.append_data_file(write_positional_deletes(table.io, table.metadata, [(data_file.file_path, position)]))
+    for data_file in _dataframe_to_data_files(table.metadata, _keyed_rows((key, name)), table.io, update.commit_uuid):
+        update.append_data_file(data_file)
+    update.commit()
+    tx.commit_transaction()
+
+
+@pytest.mark.parametrize("merge_on_read", [False, True], ids=["copy_on_write_winner", "merge_on_read_winner"])
+@pytest.mark.parametrize(("key", "position"), [(4, None), (2, 1)], ids=["new_key", "existing_key"])
+def test_concurrent_upserts_of_one_key_commit_it_once(
+    catalog: Catalog, merge_on_read: bool, key: int, position: int | None
+) -> None:
+    """Two writers resolve the same key against the same base snapshot.
+
+    Replaying the loser onto the winner would commit the key a second time, so the loser's retry is
+    refused, and its caller re-resolves the upsert against the winner's snapshot.
+    """
+    identifier = "default.test_concurrent_upserts_of_one_key"
+    table = _keyed_table(catalog, identifier)
+    loser = catalog.load_table(identifier)
+
+    if merge_on_read:
+        _merge_on_read_upsert(table, key, "winner", position)
+    else:
+        table.upsert(_keyed_rows((key, "winner")))
+    snapshot_count = len(catalog.load_table(identifier).snapshots())
+
+    with pytest.raises(ValidationException):
+        loser.upsert(_keyed_rows((key, "loser")))
+
+    expected = {1: "a", 2: "b", 3: "c", key: "winner"}
+    assert _rows(catalog, identifier) == sorted(expected.items())
+    assert len(catalog.load_table(identifier).snapshots()) == snapshot_count
+
+    res = catalog.load_table(identifier).upsert(_keyed_rows((key, "loser")))
+    assert_upsert_result(res, expected_updated=1, expected_inserted=0)
+    assert _rows(catalog, identifier) == sorted({**expected, key: "loser"}.items())
+
+
+def test_an_upsert_validates_the_keys_it_inserts_as_well_as_those_it_updates(catalog: Catalog) -> None:
+    """The conflict-detection filter is every key the upsert matched against, not only the keys it updated."""
+    identifier = "default.test_upsert_validates_inserted_keys"
+    table = _keyed_table(catalog, identifier)
+    loser = catalog.load_table(identifier)
+
+    table.upsert(_keyed_rows((4, "winner")))
+
+    with pytest.raises(ValidationException):
+        loser.upsert(_keyed_rows((2, "loser"), (4, "loser")))
+
+    assert _rows(catalog, identifier) == [(1, "a"), (2, "b"), (3, "c"), (4, "winner")]
+
+
+def test_concurrent_upserts_of_disjoint_keys_both_commit(catalog: Catalog) -> None:
+    """The check is scoped to the keys the upsert matched against, so a writer on other keys does not conflict."""
+    identifier = "default.test_concurrent_upserts_of_disjoint_keys"
+    table = _keyed_table(catalog, identifier)
+    other = catalog.load_table(identifier)
+
+    table.upsert(_keyed_rows((1, "winner")))
+    res = other.upsert(_keyed_rows((4, "other")))
+
+    assert_upsert_result(res, expected_updated=0, expected_inserted=1)
+    assert _rows(catalog, identifier) == [(1, "winner"), (2, "b"), (3, "c"), (4, "other")]
+
+
+def test_upsert_isolation_level_is_read_from_the_merge_property(catalog: Catalog) -> None:
+    """An upsert is a merge, so `write.merge.isolation-level` governs it rather than the delete or update levels."""
+    identifier = "default.test_upsert_merge_isolation_level"
+    table = _keyed_table(
+        catalog,
+        identifier,
+        {
+            TableProperties.WRITE_MERGE_ISOLATION_LEVEL: "serializable",
+            TableProperties.WRITE_DELETE_ISOLATION_LEVEL: "snapshot",
+            TableProperties.WRITE_UPDATE_ISOLATION_LEVEL: "snapshot",
+        },
+    )
+    loser = catalog.load_table(identifier)
+
+    table.upsert(_keyed_rows((4, "winner")))
+
+    with pytest.raises(ValidationException, match="Added data files were found matching the filter"):
+        loser.upsert(_keyed_rows((4, "loser")))
+
+
+def test_upsert_under_snapshot_isolation_does_not_validate_added_data(catalog: Catalog) -> None:
+    """As in Spark, snapshot isolation does not check for data added concurrently, so both inserts commit."""
+    identifier = "default.test_upsert_snapshot_isolation_added_data"
+    table = _keyed_table(
+        catalog,
+        identifier,
+        {
+            TableProperties.WRITE_MERGE_ISOLATION_LEVEL: "snapshot",
+            TableProperties.WRITE_DELETE_ISOLATION_LEVEL: "serializable",
+            TableProperties.WRITE_UPDATE_ISOLATION_LEVEL: "serializable",
+        },
+    )
+    other = catalog.load_table(identifier)
+
+    table.upsert(_keyed_rows((4, "winner")))
+    res = other.upsert(_keyed_rows((4, "other")))
+
+    assert_upsert_result(res, expected_updated=0, expected_inserted=1)
+    assert _rows(catalog, identifier) == [(1, "a"), (2, "b"), (3, "c"), (4, "other"), (4, "winner")]
+
+
+def test_upsert_under_snapshot_isolation_still_validates_deletes(catalog: Catalog) -> None:
+    """As in Spark, snapshot isolation still refuses an upsert whose rows were concurrently deleted."""
+    identifier = "default.test_upsert_snapshot_isolation_deletes"
+    table = _keyed_table(catalog, identifier, {TableProperties.WRITE_MERGE_ISOLATION_LEVEL: "snapshot"})
+    loser = catalog.load_table(identifier)
+
+    _merge_on_read_upsert(table, 2, "winner", position=1)
+
+    with pytest.raises(ValidationException, match="Found new conflicting delete files"):
+        loser.upsert(_keyed_rows((2, "loser")))
+
+    assert _rows(catalog, identifier) == [(1, "a"), (2, "winner"), (3, "c")]
+
+
+def test_upsert_on_a_branch(catalog: Catalog) -> None:
+    identifier = "default.test_upsert_on_a_branch"
+    table = _keyed_table(catalog, identifier)
+    main_snapshot_id = table.metadata.current_snapshot_id
+    assert main_snapshot_id is not None
+    table.manage_snapshots().create_branch(snapshot_id=main_snapshot_id, branch_name="dev").commit()
+
+    res = table.upsert(_keyed_rows((2, "B"), (4, "d")), branch="dev")
+
+    assert_upsert_result(res, expected_updated=1, expected_inserted=1)
+    assert table.metadata.current_snapshot_id == main_snapshot_id
+    dev = table.snapshot_by_name("dev")
+    assert dev is not None
+    assert dev.parent_snapshot_id == main_snapshot_id
+    assert dev.summary is not None and dev.summary.operation == Operation.OVERWRITE
+    rows = table.scan(snapshot_id=dev.snapshot_id).to_arrow().to_pylist()
+    assert sorted((row["id"], row["name"]) for row in rows) == [(1, "a"), (2, "B"), (3, "c"), (4, "d")]
+    assert _rows(catalog, identifier) == [(1, "a"), (2, "b"), (3, "c")]

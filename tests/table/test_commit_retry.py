@@ -49,6 +49,7 @@ def test_commit_retry_table_properties() -> None:
 def test_isolation_level_table_properties() -> None:
     assert TableProperties.WRITE_DELETE_ISOLATION_LEVEL == "write.delete.isolation-level"
     assert TableProperties.WRITE_UPDATE_ISOLATION_LEVEL == "write.update.isolation-level"
+    assert TableProperties.WRITE_MERGE_ISOLATION_LEVEL == "write.merge.isolation-level"
     assert TableProperties.WRITE_ISOLATION_LEVEL_DEFAULT == "serializable"
 
 
