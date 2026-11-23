@@ -16,6 +16,10 @@
 #  under the License.
 
 
+_MIN_SURROGATE = 0xD800
+_MAX_SURROGATE = 0xDFFF
+
+
 def truncate_upper_bound_text_string(value: str, trunc_length: int | None) -> str | None:
     result = value[:trunc_length]
     if result != value:
@@ -23,9 +27,12 @@ def truncate_upper_bound_text_string(value: str, trunc_length: int | None) -> st
 
         for i in range(-1, -len(result) - 1, -1):
             try:
-                to_inc = ord(chars[i])
+                to_inc = ord(chars[i]) + 1
+                # surrogates are not valid code points and cannot be encoded as UTF-8
+                if _MIN_SURROGATE <= to_inc <= _MAX_SURROGATE:
+                    to_inc = _MAX_SURROGATE + 1
                 # will raise exception if the highest unicode code is reached
-                _next = chr(to_inc + 1)
+                _next = chr(to_inc)
                 chars[i] = _next
                 return "".join(chars)
             except ValueError:
