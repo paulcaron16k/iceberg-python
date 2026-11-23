@@ -651,6 +651,45 @@ def test_metrics_invalid_upper_bound() -> None:
     assert datafile.upper_bounds[3] == "".join([chr(0x10FFFF), chr(0x10FFFF)]).encode()
 
 
+def test_metrics_truncated_upper_bound_skips_surrogates() -> None:
+    table_metadata = TableMetadataUtil.parse_obj(
+        {
+            "format-version": 2,
+            "location": "s3://bucket/test/location",
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [
+                {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [{"id": 1, "name": "strings", "required": False, "type": "string"}],
+                },
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "properties": {},
+        }
+    )
+    schema = get_current_schema(table_metadata)
+    table = pa.Table.from_pydict(
+        {"strings": ["a" * 15 + chr(0xD7FF) + "tail"]}, schema=schema_to_pyarrow(table_metadata.schemas[0])
+    )
+    metadata_collector: list[Any] = []
+    with pa.BufferOutputStream() as f:
+        with pq.ParquetWriter(f, table.schema, metadata_collector=metadata_collector) as writer:
+            writer.write_table(table)
+
+    statistics = data_file_statistics_from_parquet_metadata(
+        parquet_metadata=metadata_collector[0],
+        stats_columns=compute_statistics_plan(schema, table_metadata.properties),
+        parquet_column_mapping=parquet_path_to_id_mapping(schema),
+    )
+    datafile = DataFile.from_args(**statistics.to_serialized_dict())
+
+    assert datafile.lower_bounds[1] == ("a" * 15 + chr(0xD7FF)).encode()
+    assert datafile.upper_bounds[1] == ("a" * 15 + chr(0xE000)).encode()
+
+
 def test_offsets() -> None:
     metadata, table_metadata = construct_test_table()
 

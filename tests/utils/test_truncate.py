@@ -22,6 +22,17 @@ def test_upper_bound_string_truncation() -> None:
     assert truncate_upper_bound_text_string("".join([chr(0x10FFFF), chr(0x10FFFF), chr(0x0)]), 2) is None
 
 
+def test_upper_bound_string_truncation_skips_surrogates() -> None:
+    assert truncate_upper_bound_text_string("".join([chr(0xD7FF), chr(0xD7FF), "a"]), 2) == "".join([chr(0xD7FF), chr(0xE000)])
+    assert truncate_upper_bound_text_string("".join([chr(0xD7FF), chr(0x10FFFF), "a"]), 2) == "".join(
+        [chr(0xE000), chr(0x10FFFF)]
+    )
+    for value in ["".join([chr(0xD7FF), chr(0xD7FF), "a"]), "".join([chr(0xD7FF), chr(0x10FFFF), "a"])]:
+        upper = truncate_upper_bound_text_string(value, 2)
+        assert upper is not None
+        assert upper.encode("utf-8") > value.encode("utf-8")
+
+
 def test_upper_bound_binary_truncation() -> None:
     assert truncate_upper_bound_binary_string(b"\x01\x02\x03", 2) == b"\x01\x03"
     assert truncate_upper_bound_binary_string(b"\xff\xff\x00", 2) is None
